@@ -1,0 +1,12 @@
+streamlit
+numpy
+pandas
+plost
+streamlit_folium
+folium
+scapy
+streamlit_echarts
+geoip2
+streamlit_option_menu
+plotly
+requests
