@@ -28,8 +28,6 @@ from streamlit_option_menu import option_menu
 from utils.pcap_decode import PcapDecode
 import time
 import plotly.express as px
-from fpdf import FPDF
-# from streamlit_pandas_profiling import st_profile_report
 # from folium.plugins import HeatMap
 
 PD = PcapDecode()  # Parser
