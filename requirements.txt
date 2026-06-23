@@ -10,3 +10,4 @@ geoip2
 streamlit_option_menu
 plotly
 requests
+fpdf2

@@ -28,6 +28,7 @@ from streamlit_option_menu import option_menu
 from utils.pcap_decode import PcapDecode
 import time
 import plotly.express as px
+from fpdf import FPDF
 # from streamlit_pandas_profiling import st_profile_report
 # from folium.plugins import HeatMap
 
@@ -1012,6 +1013,24 @@ def OutboundIPTotalTrafficChart(data):  # ip_flow['out_keyl'],ip_flow['out_len']
     st.plotly_chart(fig)
 
 
+def common_protocol_df(data):
+    data = {k: v for k, v in data.items() if v > 0}
+    return pd.DataFrame({'Protocol': list(data.keys()), 'Packet Count': list(data.values())})
+
+
+def generate_table_pdf(title, df, orientation="P", col_widths=None):
+    pdf = FPDF(orientation=orientation)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+    pdf.set_font("Helvetica", size=9)
+    table_data = [list(df.columns)] + df.astype(str).values.tolist()
+    with pdf.table(table_data, col_widths=col_widths):
+        pass
+    return bytes(pdf.output())
+
+
 def DrawFoliumMap(data):
     m = folium.Map(location=[data.iloc[0]['Coordinates'][1], data.iloc[0]['Coordinates'][0]],
                    zoom_start=5)
@@ -1188,6 +1207,13 @@ def main():
                     # Row 1
                     with st.expander("Common Protocol Statistics"):
                         CommonProtocolStatistics_ploty(data_protocol_stats)
+                        st.download_button(
+                            "Download as PDF",
+                            data=generate_table_pdf("Common Protocol Statistics", common_protocol_df(data_protocol_stats)),
+                            file_name="common_protocol_statistics.pdf",
+                            mime="application/pdf",
+                            key="download_common_protocol_stats_pdf",
+                        )
 
                     # Row 2 (larger height)
                     with st.expander("HTTP/HTTPS Access Statistics Details"):
@@ -1203,6 +1229,13 @@ def main():
                 st.title("Device Inventory")
                 device_df = get_device_inventory(data_of_pcap)
                 st.dataframe(device_df, use_container_width=True)
+                st.download_button(
+                    "Download as PDF",
+                    data=generate_table_pdf("Device Inventory", device_df, orientation="L", col_widths=(20, 30, 50)),
+                    file_name="device_inventory.pdf",
+                    mime="application/pdf",
+                    key="download_device_inventory_pdf",
+                )
 
                 # ///////////////////////////////////////////
                 # ////     Data of Traffic Analysis     /////
