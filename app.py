@@ -24,11 +24,10 @@ import geoip2.database
 import pydeck as pdk
 import folium
 from streamlit_option_menu import option_menu
-# from scapy.layers.inet import IP,TCP,UDP,
 from utils.pcap_decode import PcapDecode
 import time
 import plotly.express as px
-# from folium.plugins import HeatMap
+from fpdf import FPDF
 
 PD = PcapDecode()  # Parser
 PCAPS = None  # Packets
