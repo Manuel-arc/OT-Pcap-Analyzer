@@ -71,7 +71,3 @@ utils/
   GeoIP/GeoLite2-City.mmdb   # MaxMind GeoLite2 City database
 requirements.txt
 ```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
