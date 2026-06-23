@@ -5,8 +5,7 @@ OT/ICS protocol traffic (Modbus, DNP3, S7comm, BACnet, Profinet) alongside
 standard IT traffic analysis.
 
 Built on top of [paresh2806/PCAP-Analyzer](https://github.com/paresh2806/PCAP-Analyzer),
-extended with OT protocol identification, device inventory, and several bug
-fixes.
+extended with OT protocol identification, device inventory, and some QOL changes.
 
 ## Features
 
