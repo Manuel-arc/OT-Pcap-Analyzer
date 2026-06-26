@@ -15,6 +15,7 @@ from folium.plugins import MarkerCluster
 import folium
 from scapy.all import rdpcap, conf as scapy_conf
 import collections
+import ipaddress
 import tempfile
 import sys
 import pandas as pd
@@ -262,6 +263,73 @@ def get_host_ip(PCAPS):
     return host_ip
 
 
+def _classify_ttl(ttl):
+    # Passive OS guess from the initial TTL a host tends to use. Ranges are
+    # generous to tolerate a few hops of decrement between source and capture point.
+    if ttl is None:
+        return None
+    if ttl <= 64:
+        return "Linux / macOS / Unix-like (TTL~64)"
+    elif ttl <= 128:
+        return "Windows (TTL~128)"
+    else:
+        return "Network device / Solaris (TTL~255)"
+
+
+def _classify_dhcp_vendor(vendor_class):
+    # DHCP option 60 (vendor class id) is more specific than TTL when present.
+    if not vendor_class:
+        return None
+    vc = vendor_class.lower()
+    if "msft" in vc or "microsoft" in vc:
+        return "Windows (DHCP vendor class)"
+    if "android" in vc:
+        return "Android (DHCP vendor class)"
+    if "apple" in vc or "iphone" in vc or "ipad" in vc or "mac" in vc:
+        return "Apple / iOS / macOS (DHCP vendor class)"
+    if "udhcp" in vc or "dhcpcd" in vc or "busybox" in vc:
+        return "Embedded Linux (DHCP vendor class)"
+    return "Other (%s)" % vendor_class
+
+
+def guess_device_os(PCAPS):
+    # Best-effort OS guess per MAC address, combining a TTL heuristic with
+    # DHCP vendor class hints (DHCP wins when present, since it's more specific).
+    ttl_counter = collections.defaultdict(collections.Counter)
+    dhcp_hint = {}
+
+    for pcap in PCAPS:
+        if not pcap.haslayer("Ether"):
+            continue
+        ether = pcap.getlayer("Ether")
+
+        if pcap.haslayer("IP"):
+            ttl_counter[ether.src][pcap.getlayer("IP").ttl] += 1
+
+        if pcap.haslayer("DHCP") and pcap.haslayer("BOOTP"):
+            chaddr = pcap.getlayer("BOOTP").chaddr[:6]
+            mac = ':'.join('%02x' % b for b in chaddr)
+            for opt in pcap.getlayer("DHCP").options:
+                if isinstance(opt, tuple) and opt[0] == 'vendor_class_id':
+                    vendor_class = opt[1]
+                    if isinstance(vendor_class, bytes):
+                        vendor_class = vendor_class.decode('utf-8', errors='ignore')
+                    dhcp_hint[mac] = vendor_class
+                    break
+
+    os_guess = {}
+    for mac, ttls in ttl_counter.items():
+        most_common_ttl = ttls.most_common(1)[0][0]
+        os_guess[mac] = _classify_ttl(most_common_ttl) or "Unknown"
+
+    for mac, vendor_class in dhcp_hint.items():
+        classified = _classify_dhcp_vendor(vendor_class)
+        if classified:
+            os_guess[mac] = classified
+
+    return os_guess
+
+
 def get_device_inventory(PCAPS):
     # Identify devices by MAC address and resolve the manufacturer from the
     # IEEE OUI database (scapy's conf.manufdb), pairing each MAC with the
@@ -282,15 +350,24 @@ def get_device_inventory(PCAPS):
             device_ips[ether.src].add(ipv6.src)
             device_ips[ether.dst].add(ipv6.dst)
 
+    os_guess = guess_device_os(PCAPS)
+
+    max_ips_shown = 15
     rows = []
     for mac, ips in device_ips.items():
         vendor = scapy_conf.manufdb._get_manuf(mac)
         if vendor.upper() == mac.upper():
             vendor = "Unknown"
+        ips_sorted = sorted(ips)
+        if len(ips_sorted) > max_ips_shown:
+            ip_display = '%s, +%d more' % (', '.join(ips_sorted[:max_ips_shown]), len(ips_sorted) - max_ips_shown)
+        else:
+            ip_display = ', '.join(ips_sorted)
         rows.append({
             'MAC Address': mac,
             'Vendor': vendor,
-            'IP Address(es)': ', '.join(sorted(ips)),
+            'IP Address(es)': ip_display,
+            'OS Guess': os_guess.get(mac, "Unknown"),
         })
     return pd.DataFrame(rows)
 
@@ -308,65 +385,107 @@ def data_flow(PCAPS, host_ip):
     return data_flow_dict
 
 
-def data_in_out_ip(PCAPS, host_ip):
-    in_ip_packet_dict = dict()
-    in_ip_len_dict = dict()
-    out_ip_packet_dict = dict()
-    out_ip_len_dict = dict()
-    for pcap in PCAPS:
-        if pcap.haslayer("IP"):
-            dst = pcap.getlayer("IP").dst
-            src = pcap.getlayer("IP").src
-            pcap_len = len(corrupt_bytes(pcap))
-            if dst == host_ip:
-                if src in in_ip_packet_dict:
-                    in_ip_packet_dict[src] += 1
-                    in_ip_len_dict[src] += pcap_len
-                else:
-                    in_ip_packet_dict[src] = 1
-                    in_ip_len_dict[src] = pcap_len
-            elif src == host_ip:
-                if dst in out_ip_packet_dict:
-                    out_ip_packet_dict[dst] += 1
-                    out_ip_len_dict[dst] += pcap_len
-                else:
-                    out_ip_packet_dict[dst] = 1
-                    out_ip_len_dict[dst] = pcap_len
-            else:
-                pass
+def parse_ip_filter(ip_or_network):
+    # Accepts a single IP ("192.168.1.10") or a CIDR network ("192.168.1.0/24").
+    # Returns an ipaddress network object, or None if the input is blank/invalid.
+    text = (ip_or_network or "").strip()
+    if not text:
+        return None
+    try:
+        if "/" in text:
+            return ipaddress.ip_network(text, strict=False)
+        return ipaddress.ip_network(ipaddress.ip_address(text))
+    except ValueError:
+        return None
 
-    in_packet_dict = in_ip_packet_dict
-    in_len_dict = in_ip_len_dict
-    out_packet_dict = out_ip_packet_dict
-    out_len_dict = out_ip_len_dict
-    in_packet_dict = sorted(in_packet_dict.items(), key=lambda d: d[1], reverse=False)
-    in_len_dict = sorted(in_len_dict.items(), key=lambda d: d[1], reverse=False)
-    out_packet_dict = sorted(out_packet_dict.items(), key=lambda d: d[1], reverse=False)
-    out_len_dict = sorted(out_len_dict.items(), key=lambda d: d[1], reverse=False)
-    in_keyp_list = list()
-    in_packet_list = list()
-    for key, value in in_packet_dict:
-        in_keyp_list.append(key)
-        in_packet_list.append(value)
-    in_keyl_list = list()
-    in_len_list = list()
-    for key, value in in_len_dict:
-        in_keyl_list.append(key)
-        in_len_list.append(value)
-    out_keyp_list = list()
-    out_packet_list = list()
-    for key, value in out_packet_dict:
-        out_keyp_list.append(key)
-        out_packet_list.append(value)
-    out_keyl_list = list()
-    out_len_list = list()
-    for key, value in out_len_dict:
-        out_keyl_list.append(key)
-        out_len_list.append(value)
-    in_ip_dict = {'in_keyp': in_keyp_list, 'in_packet': in_packet_list, 'in_keyl': in_keyl_list, 'in_len': in_len_list,
-                  'out_keyp': out_keyp_list, 'out_packet': out_packet_list, 'out_keyl': out_keyl_list,
-                  'out_len': out_len_list}
-    return in_ip_dict
+
+def classify_int_ext(ip_str):
+    try:
+        return "Internal" if ipaddress.ip_address(ip_str).is_private else "External"
+    except ValueError:
+        return "Unknown"
+
+
+def internal_external_io_stats(PCAPS, network):
+    # For traffic where exactly one side matches the selected IP/network, classify
+    # the remote (other) side as Internal (RFC1918/private) or External (public).
+    stats = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        ip_layer = pcap.getlayer("IP")
+        src, dst = ip_layer.src, ip_layer.dst
+        try:
+            src_in = ipaddress.ip_address(src) in network
+            dst_in = ipaddress.ip_address(dst) in network
+        except ValueError:
+            continue
+
+        if dst_in and not src_in:
+            direction, remote = "Inbound", src
+        elif src_in and not dst_in:
+            direction, remote = "Outbound", dst
+        else:
+            continue
+
+        key = (direction, classify_int_ext(remote))
+        entry = stats[key]
+        entry['packets'] += 1
+        entry['bytes'] += len(corrupt_bytes(pcap))
+
+    rows = []
+    for direction in ("Inbound", "Outbound"):
+        for remote_type in ("Internal", "External"):
+            entry = stats.get((direction, remote_type), {'packets': 0, 'bytes': 0})
+            rows.append({
+                'Direction': direction,
+                'Remote Type': remote_type,
+                'Packets': entry['packets'],
+                'Bytes': entry['bytes'],
+            })
+    return pd.DataFrame(rows)
+
+
+def outside_filter_ip_table(PCAPS, network):
+    # Lists each remote IP that falls outside the selected filter (i.e. the
+    # "other side" of inbound/outbound traffic), tagged Internal/External.
+    stats = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        ip_layer = pcap.getlayer("IP")
+        src, dst = ip_layer.src, ip_layer.dst
+        try:
+            src_in = ipaddress.ip_address(src) in network
+            dst_in = ipaddress.ip_address(dst) in network
+        except ValueError:
+            continue
+
+        if dst_in and not src_in:
+            direction, remote = "Inbound", src
+        elif src_in and not dst_in:
+            direction, remote = "Outbound", dst
+        else:
+            continue
+
+        entry = stats[(remote, direction)]
+        entry['packets'] += 1
+        entry['bytes'] += len(corrupt_bytes(pcap))
+
+    columns = ['IP Address', 'Type', 'Direction', 'Packets', 'Bytes']
+    rows = []
+    for (remote, direction), entry in stats.items():
+        rows.append({
+            'IP Address': remote,
+            'Type': classify_int_ext(remote),
+            'Direction': direction,
+            'Packets': entry['packets'],
+            'Bytes': entry['bytes'],
+        })
+    df = pd.DataFrame(rows, columns=columns)
+    if not df.empty:
+        df = df.sort_values(['Type', 'Direction', 'Packets'], ascending=[True, True, False]).reset_index(drop=True)
+    return df
 
 
 def proto_flow(PCAPS, PD):
@@ -978,34 +1097,9 @@ def TotalProtocolPacketFlowbarchart(data):
     st.plotly_chart(fig)
 
 
-def InboundIPTrafficDataPacketCountChart(data):
-    # st.write("Inbound IP Traffic Data Packet Count Chart")
-    data10 = {'Inbound IP': list(data['in_keyp']), 'Number of Data Packets': list(data['in_packet'])}
-    df10 = pd.DataFrame(data10)
-    fig = px.bar(df10, x='Inbound IP', y='Number of Data Packets', color="Inbound IP",title="Inbound IP Traffic Data Packet Count Chart")
-    fig.update_layout(title_x=0.5)
-    st.plotly_chart(fig)
-
-def InboundIPTotalTrafficChart(data):
-    # st.write("Inbound IP Total Traffic Chart")
-    data11 = {'Inbound IP': list(data['in_keyl']), 'Total Data Packet Traffic': list(data['in_len'])}
-    df11 = pd.DataFrame(data11)
-    fig = px.bar(df11, x='Inbound IP', y='Total Data Packet Traffic', color="Inbound IP",title="Inbound IP Total Traffic Chart")
-    fig.update_layout(title_x=0.5)
-    st.plotly_chart(fig)
-
-def OutboundIPTrafficDataPacketCountChart(data):  # ip_flow['out_keyp'], ip_flow['out_packet']
-    # st.write("Outbound IP Traffic Data Packet Count Chart")
-    data12 = {'Outbound IP': list(data['out_keyp']), 'Number of Data Packets': list(data['out_packet'])}
-    df12 = pd.DataFrame(data12)
-    fig = px.bar(df12, x='Outbound IP', y='Number of Data Packets', color="Outbound IP",title="Outbound IP Traffic Data Packet Count Chart")
-    fig.update_layout(title_x=0.5)
-    st.plotly_chart(fig)
-def OutboundIPTotalTrafficChart(data):  # ip_flow['out_keyl'],ip_flow['out_len']
-    st.write("Outbound IP Total Traffic Chart")
-    data13 = {'Outbound IP': list(data['out_keyl']), 'Total Data Packet Traffic': list(data['out_len'])}
-    df13 = pd.DataFrame(data13)
-    fig = px.bar(df13, x='Outbound IP', y='Total Data Packet Traffic', color="Outbound IP",title="Outbound IP Total Traffic Chart")
+def InternalExternalIOChart(df):
+    fig = px.bar(df, x='Direction', y='Packets', color='Remote Type', barmode='group',
+                 title="Inbound/Outbound Packets by Internal vs External")
     fig.update_layout(title_x=0.5)
     st.plotly_chart(fig)
 
@@ -1140,7 +1234,6 @@ def main():
                 time_flow_dict = time_flow(data_of_pcap)
                 host_ip = get_host_ip(data_of_pcap)
                 data_flow_dict = data_flow(data_of_pcap, host_ip)
-                data_ip_dict = data_in_out_ip(data_of_pcap, host_ip)
                 proto_flow_dict = proto_flow(data_of_pcap, PD)
                 most_flow_dict = most_flow_statistic(data_of_pcap, PD)
                 most_flow_dict = sorted(most_flow_dict.items(), key=lambda d: d[1], reverse=True)
@@ -1228,7 +1321,7 @@ def main():
                 st.dataframe(device_df, use_container_width=True)
                 st.download_button(
                     "Download as PDF",
-                    data=generate_table_pdf("Device Inventory", device_df, orientation="L", col_widths=(20, 30, 50)),
+                    data=generate_table_pdf("Device Inventory", device_df, orientation="L", col_widths=(20, 30, 40, 60)),
                     file_name="device_inventory.pdf",
                     mime="application/pdf",
                     key="download_device_inventory_pdf",
@@ -1266,27 +1359,51 @@ def main():
 
                 # Inbound /Outbound
 
-
                 st.title("Inbound /Outbound ")
-                col5, col6 = st.columns(2)
-                with col5:
-                    # Row 1
-                    with st.expander("Inbound IP Traffic Data Packet Count Chart"):
-                        InboundIPTrafficDataPacketCountChart(data_ip_dict)  #Bar CHart axis -90 #ip_flow['in_keyp'], ip_flow['in_packet']
+                ip_filter_input = st.text_input(
+                    "Filter by IP or network (CIDR)",
+                    value=host_ip,
+                    help="Enter a single IP (e.g. 192.168.1.10) or a network in CIDR notation "
+                         "(e.g. 192.168.1.0/24). Inbound/Outbound below is computed relative to this value.",
+                    key="io_ip_filter",
+                )
+                io_network = parse_ip_filter(ip_filter_input)
+                if io_network is None:
+                    st.error("Invalid IP or CIDR network. Showing results for the auto-detected host IP instead.")
+                    io_network = parse_ip_filter(host_ip)
 
-                    # Row 2 (smaller height)
-                    with st.expander("Inbound IP Total Traffic Chart"):
-                        InboundIPTotalTrafficChart(data_ip_dict)  #Bar CHart axis -90 #ip_flow['in_keyl'],ip_flow['in_len']
+                # Internal vs External breakdown of the inbound/outbound traffic
+                io_int_ext_df = internal_external_io_stats(data_of_pcap, io_network)
+                with st.expander("Inbound/Outbound by Internal vs External IPs", expanded=True):
+                    st.caption(
+                        "Internal = private/RFC1918 address space, External = public address space, "
+                        "for the remote side of each packet matching the filter above."
+                    )
+                    InternalExternalIOChart(io_int_ext_df)
+                    st.dataframe(io_int_ext_df, use_container_width=True)
+                    st.download_button(
+                        "Download as PDF",
+                        data=generate_table_pdf("Inbound/Outbound by Internal vs External IPs", io_int_ext_df),
+                        file_name="inbound_outbound_internal_external.pdf",
+                        mime="application/pdf",
+                        key="download_io_int_ext_pdf",
+                    )
 
-                # Column 2: Uneven row heights
-                with col6:
-                    # Row 1
-                    with st.expander("Outbound IP Traffic Data Packet Count Chart"):
-                        OutboundIPTrafficDataPacketCountChart(data_ip_dict)  #Bar CHart axis -90 # ip_flow['out_keyp'], ip_flow['out_packet']
-
-                    # Row 2 (larger height)
-                    with st.expander("Outbound IP Total Traffic Chart"):
-                        OutboundIPTotalTrafficChart(data_ip_dict)   #Bar CHart axis -90 # ip_flow['out_keyl'],ip_flow['out_len']
+                # IPs outside the filter's scope, tagged Internal/External
+                outside_ip_df = outside_filter_ip_table(data_of_pcap, io_network)
+                with st.expander("IPs Outside the Filter (Internal vs External)", expanded=True):
+                    st.caption(
+                        "Every remote IP seen talking to/from the filter above that falls outside it, "
+                        "tagged Internal (private/RFC1918) or External (public)."
+                    )
+                    st.dataframe(outside_ip_df, use_container_width=True)
+                    st.download_button(
+                        "Download as PDF",
+                        data=generate_table_pdf("IPs Outside the Filter", outside_ip_df, orientation="L"),
+                        file_name="ips_outside_filter.pdf",
+                        mime="application/pdf",
+                        key="download_outside_filter_ip_pdf",
+                    )
 
 
 
