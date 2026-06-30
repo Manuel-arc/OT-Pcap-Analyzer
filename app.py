@@ -14,8 +14,14 @@ from streamlit_folium import folium_static
 from folium.plugins import MarkerCluster
 import folium
 from scapy.all import rdpcap, conf as scapy_conf
+from scapy.layers.http import HTTPResponse, HTTPRequest
+from scapy.layers.snmp import SNMP
+from scapy.contrib.enipTCP import ENIPTCP, ENIPListIdentity
+from scapy.contrib.modbus import ModbusPDU2B0EReadDeviceIdentificationResponse, ModbusObjectId
 import collections
 import ipaddress
+import re
+import struct
 import tempfile
 import sys
 import pandas as pd
@@ -45,6 +51,13 @@ if 'pcap_data_by_file' not in st.session_state:
 
 if 'parsed_file_signature' not in st.session_state:
     st.session_state.parsed_file_signature = None
+
+if 'uploader_key_version' not in st.session_state:
+    # Bumped whenever files are cleared/removed so the file_uploader widget
+    # below is recreated with a fresh key - otherwise Streamlit keeps the
+    # browser-side widget's previous selection and silently re-adds files
+    # we just removed on the next rerun.
+    st.session_state.uploader_key_version = 0
 
 def get_all_pcap(PCAPS, PD):
     pcaps = collections.OrderedDict()
@@ -242,17 +255,6 @@ def dns_stats_main(PCAPS):
     return dns_key_list, dns_value_list
 
 
-def time_flow(PCAPS):
-    time_flow_dict = collections.OrderedDict()
-    start = PCAPS[0].time
-    time_flow_dict[time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(PCAPS[0].time)))] = len(
-        corrupt_bytes(PCAPS[0]))
-    for pcap in PCAPS:
-        timediff = pcap.time - start
-        time_flow_dict[float('%.3f' % timediff)] = len(corrupt_bytes(pcap))
-    return time_flow_dict
-
-
 def get_host_ip(PCAPS):
     ip_list = list()
     for pcap in PCAPS:
@@ -330,10 +332,281 @@ def guess_device_os(PCAPS):
     return os_guess
 
 
-def get_device_inventory(PCAPS):
-    # Identify devices by MAC address and resolve the manufacturer from the
-    # IEEE OUI database (scapy's conf.manufdb), pairing each MAC with the
-    # IP address(es) it was seen using.
+def _to_text(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='ignore').strip()
+    return str(value).strip()
+
+
+def _parse_tls_sni(payload):
+    # Manually walks a TLS ClientHello (record type 0x16) to find the SNI
+    # extension. No decryption involved - this is sent in plaintext by the client.
+    try:
+        if len(payload) < 5 or payload[0] != 0x16:
+            return None
+        pos = 5
+        if payload[pos] != 0x01:  # ClientHello
+            return None
+        pos += 4  # handshake type(1) + length(3)
+        pos += 2 + 32  # client_version(2) + random(32)
+        session_id_len = payload[pos]
+        pos += 1 + session_id_len
+        cipher_suites_len = struct.unpack('>H', payload[pos:pos + 2])[0]
+        pos += 2 + cipher_suites_len
+        compression_len = payload[pos]
+        pos += 1 + compression_len
+        if pos + 2 > len(payload):
+            return None
+        ext_total_len = struct.unpack('>H', payload[pos:pos + 2])[0]
+        pos += 2
+        end = pos + ext_total_len
+        while pos + 4 <= end:
+            ext_type = struct.unpack('>H', payload[pos:pos + 2])[0]
+            ext_len = struct.unpack('>H', payload[pos + 2:pos + 4])[0]
+            pos += 4
+            if ext_type == 0x0000:  # server_name
+                sp = pos + 2  # skip server_name_list length
+                if sp + 3 > len(payload):
+                    return None
+                name_type = payload[sp]
+                name_len = struct.unpack('>H', payload[sp + 1:sp + 3])[0]
+                sp += 3
+                if name_type == 0:
+                    return payload[sp:sp + name_len].decode('utf-8', errors='ignore')
+                return None
+            pos += ext_len
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
+def _parse_bacnet_firmware(payload):
+    # Heuristic scan for a BACnet ReadProperty-Ack carrying the firmwareRevision
+    # property (context tag 1, value 44) followed by a character-string value.
+    marker = b'\x19\x2c'
+    idx = payload.find(marker)
+    if idx == -1:
+        return None
+    pos = idx + len(marker)
+    if pos < len(payload) and payload[pos] == 0x3e:  # opening tag for property value
+        pos += 1
+    if pos >= len(payload):
+        return None
+    tag_byte = payload[pos]
+    if (tag_byte >> 4) != 7:  # application tag 7 = Character String
+        return None
+    lvt = tag_byte & 0x0F
+    pos += 1
+    if lvt == 5:  # extended length: actual length is in the next byte
+        if pos >= len(payload):
+            return None
+        length = payload[pos]
+        pos += 1
+    else:
+        length = lvt
+    if length == 0:
+        return None
+    pos += 1  # skip the 1-byte string encoding marker
+    text = payload[pos:pos + length - 1].decode('utf-8', errors='ignore').strip()
+    return text or None
+
+
+def _extract_s7comm_info(payload):
+    # No scapy S7comm layer exists, so scrape printable Siemens order-code /
+    # version strings that Read-SZL module-identification responses embed as ASCII.
+    text = payload.decode('latin-1', errors='ignore')
+    order_codes = re.findall(r'6[A-Z]{2}\d[\w\-. ]{4,18}', text)
+    versions = re.findall(r'[Vv]\d{1,2}\.\d{1,2}(?:\.\d{1,2})?', text)
+    parts = list(dict.fromkeys(order_codes + versions))
+    return ', '.join(p.strip() for p in parts[:3]) if parts else None
+
+
+def _add_enip_hints(layer, add, ip):
+    if not layer.haslayer(ENIPListIdentity):
+        return
+    for item in layer.getlayer(ENIPListIdentity).items:
+        name = _to_text(item.productName)
+        rev = "%d.%d" % (item.revisionMajor, item.revisionMinor)
+        add(ip, "EtherNet/IP", "%s rev %s (vendor %d)" % (name or "device", rev, item.vendorId))
+
+
+def get_firmware_hints(PCAPS):
+    # Best-effort firmware/version fingerprints per IP, gathered from whichever
+    # application-layer protocols happen to expose that information on the wire.
+    # Each hint is kept as a (protocol, text) pair so callers can show them in
+    # separate columns instead of one combined string.
+    hints = collections.defaultdict(set)
+
+    def add(ip, protocol, text):
+        if ip and text:
+            if len(text) > 150:
+                text = text[:150] + '...'
+            hints[ip].add((protocol, text))
+
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        ip_layer = pcap.getlayer("IP")
+        src, dst = ip_layer.src, ip_layer.dst
+
+        if pcap.haslayer(HTTPResponse):
+            server = pcap.getlayer(HTTPResponse).Server
+            if server:
+                add(src, "HTTP", "Server: %s" % _to_text(server))
+        if pcap.haslayer(HTTPRequest):
+            ua = pcap.getlayer(HTTPRequest).User_Agent
+            if ua:
+                add(src, "HTTP", "User-Agent: %s" % _to_text(ua))
+
+        if pcap.haslayer(SNMP):
+            pdu = pcap.getlayer(SNMP).PDU
+            for vb in getattr(pdu, "varbindlist", None) or []:
+                oid = getattr(vb.oid, "val", None)
+                if oid == "1.3.6.1.2.1.1.1.0":  # sysDescr
+                    value = _to_text(getattr(vb.value, "val", vb.value))
+                    add(src, "SNMP", "sysDescr: %s" % value)
+
+        _add_enip_hints(pcap, add, src)
+
+        if pcap.haslayer(ModbusPDU2B0EReadDeviceIdentificationResponse):
+            obj = pcap.getlayer(ModbusPDU2B0EReadDeviceIdentificationResponse).payload
+            fields = {}
+            while isinstance(obj, ModbusObjectId):
+                fields[obj.id] = _to_text(obj.value)
+                obj = obj.payload
+            parts = []
+            if fields.get(4):  # ProductName
+                parts.append(fields[4])
+            if fields.get(2):  # MajorMinorRevision
+                parts.append("rev %s" % fields[2])
+            if not parts and fields.get(0):  # VendorName
+                parts.append(fields[0])
+            if parts:
+                add(src, "Modbus", "Device ID: %s" % ' '.join(parts))
+
+        if pcap.haslayer("TCP") and pcap.haslayer("Raw"):
+            payload = bytes(pcap.getlayer("Raw").load)
+            tcp = pcap.getlayer("TCP")
+
+            if tcp.sport == 21:
+                m = re.match(rb'220[- ](.+)', payload.strip())
+                if m:
+                    add(src, "FTP", "Banner: %s" % _to_text(m.group(0)))
+
+            if tcp.sport == 23 or tcp.dport == 23:
+                text = _to_text(payload)
+                if text and len(text) < 200 and re.search(r'(version|firmware|v\d+\.\d+)', text, re.IGNORECASE):
+                    add(src if tcp.sport == 23 else dst, "Telnet", "Banner: %s" % text)
+
+            if 5900 <= tcp.sport <= 5905 and payload.startswith(b'RFB '):
+                add(src, "VNC", "Protocol: %s" % _to_text(payload[:12]))
+
+            if tcp.sport == 102 or tcp.dport == 102:
+                info = _extract_s7comm_info(payload)
+                if info:
+                    add(src if tcp.sport == 102 else dst, "S7comm", "Info: %s" % info)
+
+            if tcp.dport == 443 or tcp.sport == 443:
+                sni = _parse_tls_sni(payload)
+                if sni:
+                    add(src, "HTTPS", "TLS SNI: %s" % sni)
+
+        if pcap.haslayer("UDP") and pcap.haslayer("Raw"):
+            payload = bytes(pcap.getlayer("Raw").load)
+            udp = pcap.getlayer("UDP")
+
+            if udp.sport == 44818 or udp.dport == 44818:
+                try:
+                    _add_enip_hints(ENIPTCP(payload), add, src)
+                except Exception:
+                    pass
+
+            if udp.sport == 47808 or udp.dport == 47808:
+                fw = _parse_bacnet_firmware(payload)
+                if fw:
+                    add(src, "BACnet", "Firmware: %s" % fw)
+
+            if udp.sport == 1900 or udp.dport == 1900:
+                text = _to_text(payload) or ''
+                m = re.search(r'SERVER:\s*(.+)', text, re.IGNORECASE)
+                if m:
+                    add(src, "SSDP", "Server: %s" % m.group(1).strip())
+
+    return hints
+
+
+# Maps a (protocol, regex) pair to an endoflife.date product slug. Limited to
+# generic open-source components with public lifecycle data - proprietary OT/ICS
+# firmware (Modbus, EtherNet/IP, S7comm, BACnet) has no such public database, so
+# those are deliberately left out rather than guessed at.
+KNOWN_SOFTWARE_PATTERNS = [
+    ("HTTP", re.compile(r'Apache/(\d+\.\d+(?:\.\d+)?)', re.IGNORECASE), "apache-http-server"),
+    ("HTTP", re.compile(r'nginx/(\d+\.\d+(?:\.\d+)?)', re.IGNORECASE), "nginx"),
+    ("FTP", re.compile(r'ProFTPD (\d+\.\d+(?:\.\d+)?)', re.IGNORECASE), "proftpd"),
+]
+
+
+def _match_known_software(protocol, hint_text):
+    for proto, pattern, slug in KNOWN_SOFTWARE_PATTERNS:
+        if proto != protocol:
+            continue
+        m = pattern.search(hint_text)
+        if m:
+            return slug, m.group(1)
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_eol_cycles(slug):
+    try:
+        resp = requests.get("https://endoflife.date/api/%s.json" % slug, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _version_tuple(version_str):
+    return tuple(int(p) for p in re.findall(r'\d+', version_str))
+
+
+def check_eol_status(slug, version):
+    cycles = _fetch_eol_cycles(slug)
+    if cycles is None:
+        return "Unknown (lookup unavailable)"
+
+    version_t = _version_tuple(version)
+    best_match, best_len = None, 0
+    for entry in cycles:
+        cycle_t = _version_tuple(str(entry.get("cycle", "")))
+        shortest = min(len(version_t), len(cycle_t))
+        if shortest == 0:
+            continue
+        match_len = 0
+        for a, b in zip(version_t, cycle_t):
+            if a != b:
+                break
+            match_len += 1
+        if match_len == shortest and match_len > best_len:
+            best_match, best_len = entry, match_len
+
+    if not best_match:
+        return "Unknown version (not in lifecycle data)"
+
+    eol = best_match.get("eol")
+    if eol is False:
+        return "Supported"
+    if isinstance(eol, str):
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return ("EOL since %s" % eol) if eol <= today_str else ("Supported (EOL on %s)" % eol)
+    return "Supported" if eol is True else "Unknown"
+
+
+def _build_device_ip_map(PCAPS):
+    # Identify devices by MAC address, pairing each MAC with the IP address(es)
+    # it was seen using.
     device_ips = collections.OrderedDict()
     for pcap in PCAPS:
         if not pcap.haslayer("Ether"):
@@ -349,40 +622,204 @@ def get_device_inventory(PCAPS):
             ipv6 = pcap.getlayer("IPv6")
             device_ips[ether.src].add(ipv6.src)
             device_ips[ether.dst].add(ipv6.dst)
+    return device_ips
 
+
+def _get_vendor(mac):
+    vendor = scapy_conf.manufdb._get_manuf(mac)
+    return "Unknown" if vendor.upper() == mac.upper() else vendor
+
+
+def get_device_inventory(PCAPS):
+    # Resolve the manufacturer via the IEEE OUI database (scapy's conf.manufdb).
+    device_ips = _build_device_ip_map(PCAPS)
     os_guess = guess_device_os(PCAPS)
 
     max_ips_shown = 15
     rows = []
     for mac, ips in device_ips.items():
-        vendor = scapy_conf.manufdb._get_manuf(mac)
-        if vendor.upper() == mac.upper():
-            vendor = "Unknown"
         ips_sorted = sorted(ips)
         if len(ips_sorted) > max_ips_shown:
             ip_display = '%s, +%d more' % (', '.join(ips_sorted[:max_ips_shown]), len(ips_sorted) - max_ips_shown)
         else:
             ip_display = ', '.join(ips_sorted)
+
         rows.append({
             'MAC Address': mac,
-            'Vendor': vendor,
+            'Vendor': _get_vendor(mac),
             'IP Address(es)': ip_display,
             'OS Guess': os_guess.get(mac, "Unknown"),
         })
     return pd.DataFrame(rows)
 
 
-def data_flow(PCAPS, host_ip):
-    data_flow_dict = {'IN': 0, 'OUT': 0}
-    for pcap in PCAPS:
-        if pcap.haslayer("IP"):
-            if pcap.getlayer("IP").src == host_ip:
-                data_flow_dict['OUT'] += 1
-            elif pcap.getlayer("IP").dst == host_ip:
-                data_flow_dict['IN'] += 1
+def get_firmware_inventory(PCAPS):
+    # One row per detected firmware/version hint, kept in its own table since
+    # devices can carry many hints and cramming them into one cell either
+    # truncates them or risks overflowing a PDF table row.
+    device_ips = _build_device_ip_map(PCAPS)
+    ip_to_mac = _build_ip_to_mac_map(device_ips)
+    firmware_hints = get_firmware_hints(PCAPS)
+
+    rows = []
+    for ip, hints in firmware_hints.items():
+        mac = ip_to_mac.get(ip, "Unknown")
+        for protocol, hint in hints:
+            match = _match_known_software(protocol, hint)
+            if match:
+                slug, version = match
+                eol_status = check_eol_status(slug, version)
             else:
-                pass
-    return data_flow_dict
+                eol_status = "N/A - vendor-specific, verify with vendor lifecycle page"
+            rows.append({
+                'MAC Address': mac,
+                'IP Address': ip,
+                'Protocol': protocol,
+                'Hint': hint,
+                'EOL Status': eol_status,
+            })
+    rows.sort(key=lambda r: (r['MAC Address'], r['IP Address'], r['Protocol'], r['Hint']))
+    return pd.DataFrame(rows)
+
+
+def _build_ip_to_mac_map(device_ips):
+    ip_to_mac = {}
+    for mac, ips in device_ips.items():
+        for ip in ips:
+            ip_to_mac.setdefault(ip, mac)
+    return ip_to_mac
+
+
+# Known AV/EDR vendor domains - matched (suffix) against DNS queries, TLS SNI,
+# and HTTP Host headers. Presence only proves the host talked to that vendor's
+# infrastructure, not that the product is actively installed/running.
+AV_EDR_VENDOR_DOMAINS = {
+    "wd.microsoft.com": "Microsoft Defender",
+    "wdcp.microsoft.com": "Microsoft Defender",
+    "smartscreen.microsoft.com": "Microsoft Defender SmartScreen",
+    "settings-win.data.microsoft.com": "Microsoft Defender/Telemetry",
+    "symantec.com": "Symantec/Broadcom Endpoint Protection",
+    "norton.com": "Norton (Gen Digital)",
+    "broadcom.com": "Symantec/Broadcom Endpoint Protection",
+    "mcafee.com": "McAfee",
+    "mcafeeasap.com": "McAfee",
+    "kaspersky.com": "Kaspersky",
+    "kaspersky-labs.com": "Kaspersky",
+    "trendmicro.com": "Trend Micro",
+    "eset.com": "ESET",
+    "sophos.com": "Sophos",
+    "sophosxl.net": "Sophos",
+    "sophosupd.com": "Sophos",
+    "crowdstrike.com": "CrowdStrike Falcon",
+    "cloudsink.net": "CrowdStrike Falcon",
+    "sentinelone.net": "SentinelOne",
+    "sentinelone.com": "SentinelOne",
+    "carbonblack.io": "VMware Carbon Black",
+    "cbdefense.com": "VMware Carbon Black",
+    "cylance.com": "BlackBerry Cylance",
+    "bitdefender.com": "Bitdefender",
+    "bitdefender.net": "Bitdefender",
+    "avast.com": "Avast",
+    "avg.com": "AVG",
+    "f-secure.com": "F-Secure/WithSecure",
+    "withsecure.com": "WithSecure",
+    "paloaltonetworks.com": "Palo Alto Cortex XDR",
+    "malwarebytes.com": "Malwarebytes",
+    "webroot.com": "Webroot",
+    "tanium.com": "Tanium (EDR/mgmt agent)",
+    "qualys.com": "Qualys (vuln/EDR agent)",
+}
+
+# Secondary signal: substrings to match against an HTTP User-Agent when the
+# domain itself didn't match (some agents call out through generic CDNs).
+AV_EDR_USER_AGENTS = [
+    ("symantec", "Symantec/Broadcom Endpoint Protection"),
+    ("mcafee", "McAfee"),
+    ("crowdstrike", "CrowdStrike Falcon"),
+    ("sentinelone", "SentinelOne"),
+    ("kaspersky", "Kaspersky"),
+    ("eset", "ESET"),
+    ("sophos", "Sophos"),
+    ("bitdefender", "Bitdefender"),
+    ("windowsdefender", "Microsoft Defender"),
+]
+
+
+def _match_vendor_domain(hostname, vendor_domains):
+    if not hostname:
+        return None
+    h = hostname.lower().rstrip('.')
+    for domain, vendor in vendor_domains.items():
+        if h == domain or h.endswith('.' + domain):
+            return vendor
+    return None
+
+
+def get_av_edr_hints(PCAPS):
+    # Best-effort detection of AV/EDR vendor traffic per IP, gathered from DNS
+    # queries, TLS SNI hostnames, and HTTP Host/User-Agent headers.
+    hits = collections.defaultdict(set)
+
+    def add(ip, vendor, evidence):
+        if ip and vendor and evidence:
+            if len(evidence) > 150:
+                evidence = evidence[:150] + '...'
+            hits[ip].add((vendor, evidence))
+
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        src = pcap.getlayer("IP").src
+
+        if pcap.haslayer("DNSQR"):
+            qname = _to_text(pcap.getlayer("DNSQR").qname)
+            vendor = _match_vendor_domain(qname, AV_EDR_VENDOR_DOMAINS)
+            if vendor:
+                add(src, vendor, "DNS query: %s" % (qname.rstrip('.') if qname else qname))
+
+        if pcap.haslayer(HTTPRequest):
+            http_req = pcap.getlayer(HTTPRequest)
+            host = _to_text(http_req.Host)
+            vendor = _match_vendor_domain(host, AV_EDR_VENDOR_DOMAINS)
+            if vendor:
+                add(src, vendor, "HTTP Host: %s" % host)
+
+            ua = _to_text(http_req.User_Agent)
+            if ua:
+                ua_lower = ua.lower()
+                for substr, ua_vendor in AV_EDR_USER_AGENTS:
+                    if substr in ua_lower:
+                        add(src, ua_vendor, "HTTP User-Agent: %s" % ua)
+                        break
+
+        if pcap.haslayer("TCP") and pcap.haslayer("Raw") and pcap.getlayer("TCP").dport == 443:
+            sni = _parse_tls_sni(bytes(pcap.getlayer("Raw").load))
+            vendor = _match_vendor_domain(sni, AV_EDR_VENDOR_DOMAINS)
+            if vendor:
+                add(src, vendor, "TLS SNI: %s" % sni)
+
+    return hits
+
+
+def get_av_edr_inventory(PCAPS):
+    # One row per (host, vendor, evidence) AV/EDR traffic match.
+    device_ips = _build_device_ip_map(PCAPS)
+    ip_to_mac = _build_ip_to_mac_map(device_ips)
+    av_hits = get_av_edr_hints(PCAPS)
+
+    rows = []
+    for ip, hits in av_hits.items():
+        mac = ip_to_mac.get(ip, "Unknown")
+        for vendor, evidence in hits:
+            rows.append({
+                'MAC Address': mac,
+                'IP Address': ip,
+                'AV/EDR Vendor': vendor,
+                'Evidence': evidence,
+            })
+    rows.sort(key=lambda r: (r['MAC Address'], r['IP Address'], r['AV/EDR Vendor'], r['Evidence']))
+    return pd.DataFrame(rows)
+
 
 
 def parse_ip_filter(ip_or_network):
@@ -488,60 +925,6 @@ def outside_filter_ip_table(PCAPS, network):
     return df
 
 
-def proto_flow(PCAPS, PD):
-    proto_flow_dict = collections.OrderedDict()
-    proto_flow_dict['IP'] = 0
-    proto_flow_dict['IPv6'] = 0
-    proto_flow_dict['ARP'] = 0
-    proto_flow_dict['ICMP'] = 0
-    proto_flow_dict['DNS'] = 0
-    proto_flow_dict['TCP'] = 0
-    proto_flow_dict['UDP'] = 0
-    proto_flow_dict['Others'] = 0
-    for pcap in PCAPS:
-        pcap_len = len(corrupt_bytes(pcap))
-        if pcap.haslayer("ARP"):
-            proto_flow_dict['ARP'] += pcap_len
-        elif pcap.haslayer("ICMP") or pcap.haslayer("ICMPv6ND_NS"):
-            proto_flow_dict['ICMP'] += pcap_len
-        elif pcap.haslayer("DNS"):
-            proto_flow_dict['DNS'] += pcap_len
-        elif pcap.haslayer("TCP"):
-            # Resolve the named protocol (Modbus, DNP3, S7comm, HTTP, ...) from
-            # utils/protocol/PORT and utils/protocol/TCP instead of lumping
-            # every TCP packet's bytes into a generic "TCP" bucket.
-            tcp = pcap.getlayer("TCP")
-            proto = PD.PORT_DICT.get(tcp.dport) or PD.PORT_DICT.get(tcp.sport) \
-                or PD.TCP_DICT.get(tcp.dport) or PD.TCP_DICT.get(tcp.sport)
-            if proto:
-                proto_flow_dict[proto] = proto_flow_dict.get(proto, 0) + pcap_len
-            else:
-                proto_flow_dict['TCP'] += pcap_len
-        elif pcap.haslayer("UDP"):
-            udp = pcap.getlayer("UDP")
-            proto = PD.PORT_DICT.get(udp.dport) or PD.PORT_DICT.get(udp.sport) \
-                or PD.UDP_DICT.get(udp.dport) or PD.UDP_DICT.get(udp.sport)
-            if proto:
-                proto_flow_dict[proto] = proto_flow_dict.get(proto, 0) + pcap_len
-            else:
-                proto_flow_dict['UDP'] += pcap_len
-        elif pcap.haslayer("IP"):
-            # IP packets carrying neither TCP nor UDP (e.g. ESP, GRE, OSPF, ...)
-            proto_flow_dict['IP'] += pcap_len
-        elif pcap.haslayer("IPv6"):
-            proto_flow_dict['IPv6'] += pcap_len
-        elif pcap.haslayer("Ether"):
-            # Non-IP Ethernet frames (e.g. Profinet RT/DCP run directly on
-            # Ethernet) - resolve by EtherType via utils/protocol/ETHER.
-            proto = PD.ETHER_DICT.get(pcap.getlayer("Ether").type)
-            if proto:
-                proto_flow_dict[proto] = proto_flow_dict.get(proto, 0) + pcap_len
-            else:
-                proto_flow_dict['Others'] += pcap_len
-        else:
-            proto_flow_dict['Others'] += pcap_len
-    return proto_flow_dict
-
 
 def most_flow_statistic(PCAPS, PD):
     most_flow_dict = collections.defaultdict(int)
@@ -560,9 +943,14 @@ def getmyip():
         return None
 
 
+GEOIP_DB_PATH = 'utils/GeoIP/GeoLite2-City.mmdb'
+
+
 def get_geo(ip):
-    reader = geoip2.database.Reader('utils/GeoIP/GeoLite2-City.mmdb')
+    if not os.path.exists(GEOIP_DB_PATH):
+        return None
     try:
+        reader = geoip2.database.Reader(GEOIP_DB_PATH)
         response = reader.city(ip)
         city_name = response.country.names['en'] + response.city.names['en']
         longitude = response.location.longitude
@@ -679,10 +1067,34 @@ def parse_uploaded_files(uploaded_files):
     return combined, pcap_by_file
 
 
+def _reset_data_view_selector_if_stale():
+    # st.selectbox raises if the value stored at its key is no longer in its
+    # options list, which happens if the currently-viewed file just got removed.
+    valid_choices = {"All Files Combined"} | set(st.session_state.pcap_data_by_file.keys())
+    if st.session_state.get("data_view_selector") not in valid_choices:
+        st.session_state.data_view_selector = "All Files Combined"
+
+
+def remove_uploaded_file(name, size):
+    st.session_state.uploaded_files = [
+        f for f in (st.session_state.uploaded_files or []) if (f.name, f.size) != (name, size)
+    ]
+    st.session_state.pcap_data_by_file.pop(name, None)
+    combined = [packet for packets in st.session_state.pcap_data_by_file.values() for packet in packets]
+    combined.sort(key=lambda p: p.time)
+    st.session_state.pcap_data = combined
+    st.session_state.parsed_file_signature = tuple(sorted((f.name, f.size) for f in st.session_state.uploaded_files))
+    # Force the file_uploader widget to forget this file too, otherwise its
+    # browser-side selection would re-add it on the next rerun.
+    st.session_state.uploader_key_version += 1
+    _reset_data_view_selector_if_stale()
+
+
 def page_file_upload():
     # File upload - stays visible so files can be added one at a time across multiple browses
     new_files = st.file_uploader(
-        "Choose CSV/PCAP files", type=["csv", "pcap", "cap"], accept_multiple_files=True
+        "Choose CSV/PCAP files", type=["csv", "pcap", "cap"], accept_multiple_files=True,
+        key="pcap_uploader_%d" % st.session_state.uploader_key_version,
     )
 
     # Merge newly selected files into the persistent set instead of replacing
@@ -711,6 +1123,8 @@ def page_file_upload():
             st.session_state.pcap_data = None
             st.session_state.pcap_data_by_file = {}
             st.session_state.parsed_file_signature = None
+            st.session_state.uploader_key_version += 1
+            _reset_data_view_selector_if_stale()
             st.rerun()
 
 
@@ -727,13 +1141,20 @@ def select_active_pcap_data():
 
 
 def page_display_info():
-    # Display uploaded file information
+    # Display uploaded file information, each with its own delete button so
+    # files can be removed individually instead of only all at once.
     if st.session_state.get("uploaded_files"):
         for uploaded_file in st.session_state.uploaded_files:
-            file_details = {"File Name": uploaded_file.name,
-                            "File Type": uploaded_file.type,
-                            "File Size": uploaded_file.size}
-            st.write(file_details)
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                file_details = {"File Name": uploaded_file.name,
+                                "File Type": uploaded_file.type,
+                                "File Size": uploaded_file.size}
+                st.write(file_details)
+            with col2:
+                if st.button("Remove", key="remove_file_%s_%d" % (uploaded_file.name, uploaded_file.size)):
+                    remove_uploaded_file(uploaded_file.name, uploaded_file.size)
+                    st.rerun()
 
 
 def Intro():
@@ -765,6 +1186,18 @@ def Intro():
 
         """
     )
+
+
+_MAC_PATTERN = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
+_TRAILING_PORT_PATTERN = re.compile(r':\d{1,5}$')
+
+
+def _strip_port(value):
+    # The Source/Destination columns hold "ip:port" for TCP/UDP rows but a
+    # bare MAC address for other traffic - only strip a real port suffix.
+    if not isinstance(value, str) or _MAC_PATTERN.match(value):
+        return value
+    return _TRAILING_PORT_PATTERN.sub('', value)
 
 
 def RawDataView():
@@ -801,17 +1234,19 @@ def RawDataView():
         )
         # st.sidebar.divider()
 
-        # Sidebar text input for filtering by Source
-        filter_source = st.sidebar.text_input("Filter by Source:", "")
+        # Sidebar dropdown for filtering by Source - lists only the IPs actually present
+        source_options = ["All"] + sorted({_strip_port(v) for v in dataframe_data["Source"].dropna()})
+        filter_source = st.sidebar.selectbox("Filter by Source:", source_options)
         # st.sidebar.divider()
 
-        # Sidebar text input for filtering by Destination
-        filter_destination = st.sidebar.text_input("Filter by Destination:", "")
+        # Sidebar dropdown for filtering by Destination - lists only the IPs actually present
+        destination_options = ["All"] + sorted({_strip_port(v) for v in dataframe_data["Destination"].dropna()})
+        filter_destination = st.sidebar.selectbox("Filter by Destination:", destination_options)
         # st.sidebar.divider()
 
         # Apply filters based on user selection
         if (
-                selected_protocols is None or not selected_protocols) and not filter_value_len and not filter_source and not filter_destination:
+                selected_protocols is None or not selected_protocols) and not filter_value_len and filter_source == "All" and filter_destination == "All":
             st.write("All PCAPs:")
             Data_to_display_df = dataframe_data.copy()
             st.dataframe(Data_to_display_df, use_container_width=True)
@@ -832,19 +1267,19 @@ def RawDataView():
                 ]
 
             # Filter by Source
-            if filter_source:
+            if filter_source != "All":
                 Data_to_display_df = Data_to_display_df[
-                    Data_to_display_df["Source"].str.contains(filter_source, case=False, na=False)]
+                    Data_to_display_df["Source"].apply(_strip_port) == filter_source]
 
             # Filter by Destination
-            if filter_destination:
+            if filter_destination != "All":
                 Data_to_display_df = Data_to_display_df[
-                    Data_to_display_df["Destination"].str.contains(filter_destination, case=False, na=False)]
+                    Data_to_display_df["Destination"].apply(_strip_port) == filter_destination]
 
             # Display the filtered dataframe
             st.write("Filtered PCAPs:")
 
-            column_check = st.checkbox("Do you want to filter the data by column wise also ???")
+            column_check = st.checkbox("Filter the data by column")
             if column_check:
                 # Multiselect for filtering by columns
                 selected_columns = st.multiselect(
@@ -853,8 +1288,7 @@ def RawDataView():
                 )
                 Data_to_display_df = Data_to_display_df[selected_columns]
             # selected_columns = [col for col in Data_to_display_df.columns if st.checkbox(col, value=True )]
-            st.checkbox("Use container width", value=True, key="use_container_width")
-            st.dataframe(Data_to_display_df, use_container_width=st.session_state.use_container_width)
+            st.dataframe(Data_to_display_df, use_container_width=True)
 
             st.subheader("Statistics of Selected Data")
             # Time Analysis
@@ -1013,90 +1447,6 @@ def DNSAccessStatistics(key, value):
     st.plotly_chart(fig)
 
 
-def TimeFlowChart(data):
-    data6 = {'Relative_Time': list(data.keys()), 'Packet_Bytes': list(data.values())}
-    df6 = pd.DataFrame(data6)
-    fig = px.line(df6, x='Relative_Time', y="Packet_Bytes",title="Time Flow Chart")
-    fig.update_layout(title_x=0.5)
-    st.plotly_chart(fig)
-def DataInOutStatistics(data):
-    # st.write("Data In/Out Statistics")
-    data7 = {'In/Out': list(data.keys()), 'freq': list(data.values())}
-    df7 = pd.DataFrame(data7)
-
-    options = {
-        "title": {"text": "Data In/Out Statistics", "subtext": "", "left": "center"},
-        "tooltip": {"trigger": "item"},
-        "legend": {"orient": "vertical", "left": "left", },
-        "series": [
-            {
-                "name": "Data ",
-                "type": "pie",
-                "radius": "50%",
-                "data": [
-                    {"value": count, "name": pcap_len}
-                    for pcap_len, count in zip(df7['In/Out'], df7['freq'])
-                ],
-                "emphasis": {
-                    "itemStyle": {
-                        "shadowBlur": 10,
-                        "shadowOffsetX": 0,
-                        "shadowColor": "rgba(0, 0, 0, 0.5)",
-                    }
-                },
-            }
-        ],
-        "backgroundColor": "rgba(0, 0, 0, 0)",  # Transparent background
-    }
-
-    # st.write("Data Packet Length Statistics")
-    st_echarts(options=options, height="600px", renderer='svg')
-
-def TotalProtocolPacketFlow(data):
-    # st.write("Total Protocol Packet Flow bar chart")
-    data = {k: v for k, v in data.items() if v > 0}
-    data8 = {'Protocol': list(data.keys()), 'freq': list(data.values())}
-    df8 = pd.DataFrame(data8)
-
-    options = {
-        "title": {"text": "Total Protocol PacketFlow", "subtext": "", "left": "center"},
-        "tooltip": {"trigger": "item"},
-        "legend": {"orient": "vertical", "left": "left", },
-        "series": [
-            {
-                "name": "Protocols",
-                "type": "pie",
-                "radius": "50%",
-                "data": [
-                    {"value": count, "name": pcap_len}
-                    for pcap_len, count in zip(df8['Protocol'], df8['freq'])
-                ],
-                "emphasis": {
-                    "itemStyle": {
-                        "shadowBlur": 10,
-                        "shadowOffsetX": 0,
-                        "shadowColor": "rgba(0, 0, 0, 0.5)",
-                    }
-                },
-            }
-        ],
-        "backgroundColor": "rgba(0, 0, 0, 0)",  # Transparent background
-    }
-
-    # st.write("Data Packet Length Statistics")
-    st_echarts(options=options, height="600px", renderer='svg')
-
-def TotalProtocolPacketFlowbarchart(data):
-    # st.write("Total Protocol Packet Flow bar chart")
-    data = {k: v for k, v in data.items() if v > 0}
-    data9 = {'Protocol': list(data.keys()), 'freq': list(data.values())}
-    df9 = pd.DataFrame(data9)
-    fig = px.bar(df9, x='Protocol', y='freq', color="Protocol",title="Total Protocol Packet Flow bar chart")
-    fig.update_layout(title_x=0.5)
-
-    st.plotly_chart(fig)
-
-
 def InternalExternalIOChart(df):
     fig = px.bar(df, x='Direction', y='Packets', color='Remote Type', barmode='group',
                  title="Inbound/Outbound Packets by Internal vs External")
@@ -1177,7 +1527,7 @@ def main():
         # get analysis of data
         else:
             data_of_pcap = select_active_pcap_data()
-            if data_of_pcap is None:
+            if not data_of_pcap:
                 art = """
                 .....+@*+@+..................................................*@+*@+.....
                 ....%-....:*................................................*:....:@....
@@ -1231,10 +1581,7 @@ def main():
                 # Data Protocol analysis end
 
                 # Traffic analysis start
-                time_flow_dict = time_flow(data_of_pcap)
                 host_ip = get_host_ip(data_of_pcap)
-                data_flow_dict = data_flow(data_of_pcap, host_ip)
-                proto_flow_dict = proto_flow(data_of_pcap, PD)
                 most_flow_dict = most_flow_statistic(data_of_pcap, PD)
                 most_flow_dict = sorted(most_flow_dict.items(), key=lambda d: d[1], reverse=True)
                 if len(most_flow_dict) > 10:
@@ -1327,35 +1674,41 @@ def main():
                     key="download_device_inventory_pdf",
                 )
 
-                # ///////////////////////////////////////////
-                # ////     Data of Traffic Analysis     /////
-                # ///////////////////////////////////////////
-                st.title("Data of Traffic Analysis")
-                col3, col4 = st.columns(2)
-                with col3:
-                    # Row 1
-                    with st.expander("Time Flow Chart"):
-                        TimeFlowChart(time_flow_dict)
+                st.title("Firmware/Version Hints")
+                firmware_df = get_firmware_inventory(data_of_pcap)
+                if firmware_df.empty:
+                    st.info("No firmware/version hints found (requires unencrypted "
+                            "HTTP/SNMP/Modbus/EtherNet-IP/FTP/Telnet/VNC/S7comm/BACnet/SSDP traffic).")
+                else:
+                    st.dataframe(firmware_df, use_container_width=True)
+                    st.download_button(
+                        "Download as PDF",
+                        data=generate_table_pdf("Firmware/Version Hints", firmware_df, orientation="L", col_widths=(25, 25, 20, 60, 50)),
+                        file_name="firmware_version_hints.pdf",
+                        mime="application/pdf",
+                        key="download_firmware_hints_pdf",
+                    )
 
-                    # Row 2 (smaller height)
-                    with st.expander("Data In/Out Statistics"):
-                        DataInOutStatistics(data_flow_dict)
-
-
-
-                # Column 2: Uneven row heights
-                with col4:
-                    # Row 1
-                    with st.expander("Total Protocol Packet Flow"):
-                        TotalProtocolPacketFlow(proto_flow_dict)
-
-
-                    # Row 2 (larger height)
-                    with st.expander("Total Protocol Packet Flow bar chart"):
-                        TotalProtocolPacketFlowbarchart(proto_flow_dict)
-
-
-
+                st.title("AV/EDR Vendor Traffic")
+                av_edr_df = get_av_edr_inventory(data_of_pcap)
+                if av_edr_df.empty:
+                    st.info("No AV/EDR vendor traffic detected (matches DNS queries, TLS SNI, and "
+                            "HTTP Host/User-Agent against known antivirus/EDR vendor domains). "
+                            "Absence doesn't mean no AV is installed - it may simply not have "
+                            "phoned home during this capture, or use a non-cloud update server.")
+                else:
+                    st.caption(
+                        "Presence only proves the host talked to that vendor's infrastructure, "
+                        "not that the product is actively installed, running, or up to date."
+                    )
+                    st.dataframe(av_edr_df, use_container_width=True)
+                    st.download_button(
+                        "Download as PDF",
+                        data=generate_table_pdf("AV/EDR Vendor Traffic", av_edr_df, orientation="L", col_widths=(25, 25, 40, 90)),
+                        file_name="av_edr_vendor_traffic.pdf",
+                        mime="application/pdf",
+                        key="download_av_edr_pdf",
+                    )
 
                 # Inbound /Outbound
 
@@ -1413,7 +1766,13 @@ def main():
         # ///////////////////////////////////////////
         # ////              Data of Geoplot     /////
         # ///////////////////////////////////////////
-        if "pcap_data" not in st.session_state:
+        if not os.path.exists(GEOIP_DB_PATH):
+            st.warning(
+                "GeoIP database not found at `%s`. Download the free MaxMind "
+                "GeoLite2 City database (requires a free MaxMind account) and "
+                "place the `.mmdb` file at that path to enable Geoplots." % GEOIP_DB_PATH
+            )
+        elif "pcap_data" not in st.session_state:
             st.session_state.pcap_data = []
             st.warning("No valid data for Geoplot.")
         else:
