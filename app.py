@@ -1200,6 +1200,69 @@ def _strip_port(value):
     return _TRAILING_PORT_PATTERN.sub('', value)
 
 
+def _split_ip_port(value):
+    ip = _strip_port(value)
+    if ip == value:
+        return ip, None
+    return ip, value[len(ip) + 1:]
+
+
+def _render_ip_counts(label, series, widget_key):
+    # Aggregates "ip:port" rows by bare IP so the same IP isn't split across
+    # multiple count rows just because it used different ports. Click a row
+    # for an IP that used more than one port to see the per-port breakdown
+    # right underneath; single-port (or non-IP) rows just show their count.
+    ip_totals = collections.Counter()
+    ip_ports = collections.defaultdict(collections.Counter)
+    for value in series.dropna():
+        ip, port = _split_ip_port(value)
+        ip_totals[ip] += 1
+        if port is not None:
+            ip_ports[ip][port] += 1
+
+    st.subheader(label)
+    ips = [ip for ip, _ in ip_totals.most_common()]
+    port_display = []
+    for ip in ips:
+        ports = ip_ports.get(ip, {})
+        if len(ports) > 1:
+            port_display.append("Multiple (%d)" % len(ports))
+        elif len(ports) == 1:
+            port_display.append(next(iter(ports)))
+        else:
+            port_display.append("-")
+
+    counts_df = pd.DataFrame({
+        'IP': ips,
+        'Port': port_display,
+        'Count': [ip_totals[ip] for ip in ips],
+    })
+
+    # Streamlit's dataframe selection has no per-row disable, so the row
+    # checkbox stays clickable for every row - but for single-port IPs the
+    # port is already shown inline above, so selecting one is a harmless no-op.
+    event = st.dataframe(
+        counts_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=widget_key,
+    )
+
+    selected_rows = event["selection"]["rows"]
+    if selected_rows:
+        selected_ip = ips[selected_rows[0]]
+        ports = ip_ports.get(selected_ip)
+        if ports and len(ports) > 1:
+            ports_df = pd.DataFrame({
+                'Port': list(ports.keys()),
+                'Packets': list(ports.values()),
+            }).sort_values('Packets', ascending=False)
+            st.caption("Ports used by %s:" % selected_ip)
+            st.dataframe(ports_df, hide_index=True, use_container_width=True)
+
+
 def RawDataView():
     pcap_data = select_active_pcap_data()
     if pcap_data:
@@ -1306,9 +1369,7 @@ def RawDataView():
                 st.table(Data_to_display_df['len'].describe())
 
                 # Source Counts
-                source_counts = Data_to_display_df['Source'].value_counts()
-                st.subheader("Source Counts:")
-                st.table(source_counts)
+                _render_ip_counts("Source Counts:", Data_to_display_df['Source'], "source_ports_dropdown")
 
             # Column 2: Protocol Distribution and Destination Counts
             with col2:
@@ -1318,9 +1379,7 @@ def RawDataView():
                 st.table(protocol_counts)
 
                 # Destination Counts
-                destination_counts = Data_to_display_df['Destination'].value_counts()
-                st.subheader("Destination Counts:")
-                st.table(destination_counts)
+                _render_ip_counts("Destination Counts:", Data_to_display_df['Destination'], "destination_ports_dropdown")
     else:
         st.warning("Please upload a valid PCAP file.")
 
