@@ -20,6 +20,8 @@ from scapy.contrib.enipTCP import ENIPTCP, ENIPListIdentity
 from scapy.contrib.modbus import ModbusPDU2B0EReadDeviceIdentificationResponse, ModbusObjectId
 import collections
 import ipaddress
+import pathlib
+import pickle
 import re
 import struct
 import tempfile
@@ -39,6 +41,54 @@ from fpdf import FPDF
 PD = PcapDecode()  # Parser
 PCAPS = None  # Packets
 
+# ── Session persistence ───────────────────────────────────────────────────────
+# Parsed packet data (scapy Packet objects) is pickled to disk so it survives
+# a browser page-refresh without requiring the user to re-upload their files.
+# The original UploadedFile objects cannot be persisted (they're tied to the
+# active upload session), but the parsed pcap_data_by_file dict can.
+
+_CACHE_DIR = pathlib.Path.home() / ".cache" / "ot-pcap-analyzer"
+_CACHE_FILE = _CACHE_DIR / "session.pkl"
+
+
+def _save_session_cache():
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'pcap_data': st.session_state.pcap_data,
+            'pcap_data_by_file': st.session_state.pcap_data_by_file,
+            'parsed_file_signature': st.session_state.parsed_file_signature,
+            'file_metadata': st.session_state.get('file_metadata', {}),
+        }
+        with open(_CACHE_FILE, 'wb') as f:
+            pickle.dump(payload, f)
+    except Exception:
+        pass
+
+
+def _load_session_cache():
+    try:
+        if not _CACHE_FILE.exists():
+            return False
+        with open(_CACHE_FILE, 'rb') as f:
+            payload = pickle.load(f)
+        st.session_state.pcap_data = payload.get('pcap_data')
+        st.session_state.pcap_data_by_file = payload.get('pcap_data_by_file', {})
+        st.session_state.parsed_file_signature = payload.get('parsed_file_signature')
+        st.session_state.file_metadata = payload.get('file_metadata', {})
+        return bool(st.session_state.pcap_data_by_file)
+    except Exception:
+        return False
+
+
+def _clear_session_cache():
+    try:
+        if _CACHE_FILE.exists():
+            _CACHE_FILE.unlink()
+    except Exception:
+        pass
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = None
@@ -52,12 +102,19 @@ if 'pcap_data_by_file' not in st.session_state:
 if 'parsed_file_signature' not in st.session_state:
     st.session_state.parsed_file_signature = None
 
+if 'file_metadata' not in st.session_state:
+    st.session_state.file_metadata = {}
+
 if 'uploader_key_version' not in st.session_state:
     # Bumped whenever files are cleared/removed so the file_uploader widget
     # below is recreated with a fresh key - otherwise Streamlit keeps the
     # browser-side widget's previous selection and silently re-adds files
     # we just removed on the next rerun.
     st.session_state.uploader_key_version = 0
+
+# Restore parsed data from disk on a fresh session (e.g. after page refresh).
+if st.session_state.pcap_data is None and not st.session_state.pcap_data_by_file:
+    _load_session_cache()
 
 def get_all_pcap(PCAPS, PD):
     pcaps = collections.OrderedDict()
@@ -1080,14 +1137,15 @@ def remove_uploaded_file(name, size):
         f for f in (st.session_state.uploaded_files or []) if (f.name, f.size) != (name, size)
     ]
     st.session_state.pcap_data_by_file.pop(name, None)
+    st.session_state.file_metadata.pop(name, None)
     combined = [packet for packets in st.session_state.pcap_data_by_file.values() for packet in packets]
     combined.sort(key=lambda p: p.time)
-    st.session_state.pcap_data = combined
-    st.session_state.parsed_file_signature = tuple(sorted((f.name, f.size) for f in st.session_state.uploaded_files))
-    # Force the file_uploader widget to forget this file too, otherwise its
-    # browser-side selection would re-add it on the next rerun.
+    st.session_state.pcap_data = combined or None
+    remaining = st.session_state.uploaded_files or []
+    st.session_state.parsed_file_signature = tuple(sorted((f.name, f.size) for f in remaining))
     st.session_state.uploader_key_version += 1
     _reset_data_view_selector_if_stale()
+    _save_session_cache()
 
 
 def page_file_upload():
@@ -1116,15 +1174,41 @@ def page_file_upload():
                 st.session_state.pcap_data = combined
                 st.session_state.pcap_data_by_file = pcap_by_file
             st.session_state.parsed_file_signature = file_signature
+            # Keep lightweight metadata so we can show file info after a refresh
+            # (UploadedFile objects themselves cannot be pickled/persisted).
+            for f in uploaded_files:
+                st.session_state.file_metadata[f.name] = {
+                    'name': f.name, 'size': f.size, 'type': getattr(f, 'type', ''),
+                }
+            _save_session_cache()
 
-        st.success(f"{len(uploaded_files)} file(s) uploaded successfully!")
+        st.success(f"{len(uploaded_files)} file(s) loaded.")
         if st.button("Clear All Uploaded Files"):
             st.session_state.uploaded_files = None
             st.session_state.pcap_data = None
             st.session_state.pcap_data_by_file = {}
             st.session_state.parsed_file_signature = None
+            st.session_state.file_metadata = {}
             st.session_state.uploader_key_version += 1
             _reset_data_view_selector_if_stale()
+            _clear_session_cache()
+            st.rerun()
+    elif st.session_state.pcap_data_by_file:
+        # Data was restored from cache (no active upload). Show a banner so
+        # the user knows why analysis is available without any upload widget.
+        st.info(
+            "Showing data from a previous session. "
+            "Upload new files above to replace, or use **Clear All** to start fresh."
+        )
+        if st.button("Clear All Uploaded Files"):
+            st.session_state.uploaded_files = None
+            st.session_state.pcap_data = None
+            st.session_state.pcap_data_by_file = {}
+            st.session_state.parsed_file_signature = None
+            st.session_state.file_metadata = {}
+            st.session_state.uploader_key_version += 1
+            _reset_data_view_selector_if_stale()
+            _clear_session_cache()
             st.rerun()
 
 
@@ -1141,19 +1225,36 @@ def select_active_pcap_data():
 
 
 def page_display_info():
-    # Display uploaded file information, each with its own delete button so
-    # files can be removed individually instead of only all at once.
-    if st.session_state.get("uploaded_files"):
-        for uploaded_file in st.session_state.uploaded_files:
+    # Display per-file info and a Remove button for each loaded file.
+    # After a page refresh, uploaded_files is gone (UploadedFile objects don't
+    # survive a session reset), but file_metadata persisted to disk so we can
+    # still show the file list and allow individual removal.
+    uploaded = st.session_state.get("uploaded_files") or []
+    restored_meta = st.session_state.get("file_metadata", {})
+
+    if uploaded:
+        # Normal path: active upload session — UploadedFile objects available.
+        for uploaded_file in uploaded:
             col1, col2 = st.columns([5, 1])
             with col1:
-                file_details = {"File Name": uploaded_file.name,
-                                "File Type": uploaded_file.type,
-                                "File Size": uploaded_file.size}
-                st.write(file_details)
+                st.write({"File Name": uploaded_file.name,
+                          "File Type": uploaded_file.type,
+                          "File Size": uploaded_file.size})
             with col2:
                 if st.button("Remove", key="remove_file_%s_%d" % (uploaded_file.name, uploaded_file.size)):
                     remove_uploaded_file(uploaded_file.name, uploaded_file.size)
+                    st.rerun()
+    elif restored_meta:
+        # Refresh-restore path: no UploadedFile objects, but metadata survived.
+        for name, meta in restored_meta.items():
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.write({"File Name": meta.get("name", name),
+                          "File Type": meta.get("type", ""),
+                          "File Size": meta.get("size", "")})
+            with col2:
+                if st.button("Remove", key="remove_cached_%s" % name):
+                    remove_uploaded_file(name, meta.get("size", 0))
                     st.rerun()
 
 
