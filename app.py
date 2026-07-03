@@ -17,7 +17,11 @@ from scapy.all import rdpcap, conf as scapy_conf
 from scapy.layers.http import HTTPResponse, HTTPRequest
 from scapy.layers.snmp import SNMP
 from scapy.contrib.enipTCP import ENIPTCP, ENIPListIdentity
-from scapy.contrib.modbus import ModbusPDU2B0EReadDeviceIdentificationResponse, ModbusObjectId
+from scapy.contrib.modbus import (
+    ModbusPDU2B0EReadDeviceIdentificationResponse, ModbusObjectId,
+    ModbusADURequest, ModbusADUResponse,
+)
+import base64
 import collections
 import ipaddress
 import pathlib
@@ -26,6 +30,7 @@ import re
 import struct
 import tempfile
 import sys
+from streamlit_agraph import agraph, Node, Edge, Config
 import pandas as pd
 from scapy.utils import corrupt_bytes
 from streamlit_echarts import st_echarts
@@ -37,6 +42,7 @@ from utils.pcap_decode import PcapDecode
 import time
 import plotly.express as px
 from fpdf import FPDF
+from fpdf.fonts import FontFace
 
 PD = PcapDecode()  # Parser
 PCAPS = None  # Packets
@@ -878,6 +884,45 @@ def get_av_edr_inventory(PCAPS):
     return pd.DataFrame(rows)
 
 
+# ── Analysis result cache ─────────────────────────────────────────────────────
+# Parameters prefixed with _ are excluded from st.cache_data's hash, so the
+# (unhashable) packet list is passed through without being hashed. The `sig`
+# tuple (file name + size pairs) acts as the unique cache key instead.
+
+@st.cache_data(show_spinner=False)
+def _cached_device_inventory(sig, _pcap):
+    return get_device_inventory(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_firmware_inventory(sig, _pcap):
+    return get_firmware_inventory(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_av_edr_inventory(sig, _pcap):
+    return get_av_edr_inventory(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_security_alerts(sig, _pcap):
+    return get_security_alerts(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_credential_exposure(sig, _pcap):
+    return get_credential_exposure(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_modbus_breakdown(sig, _pcap):
+    return get_modbus_breakdown(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_topology(sig, _pcap):
+    return build_topology(_pcap)
+
+@st.cache_data(show_spinner=False)
+def _cached_all_pcap(sig, _pcap, _pd):
+    return get_all_pcap(_pcap, _pd)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def parse_ip_filter(ip_or_network):
     # Accepts a single IP ("192.168.1.10") or a CIDR network ("192.168.1.0/24").
@@ -891,6 +936,13 @@ def parse_ip_filter(ip_or_network):
         return ipaddress.ip_network(ipaddress.ip_address(text))
     except ValueError:
         return None
+
+
+def _ip_in_network(ip_str, network):
+    try:
+        return ipaddress.ip_address(ip_str) in network
+    except ValueError:
+        return False
 
 
 def classify_int_ext(ip_str):
@@ -1170,12 +1222,14 @@ def page_file_upload():
         file_signature = tuple(sorted(accumulated.keys()))
         if st.session_state.parsed_file_signature != file_signature:
             with st.spinner("Parsing uploaded file(s)..."):
-                combined, pcap_by_file = parse_uploaded_files(uploaded_files)
+                _, pcap_by_file = parse_uploaded_files(uploaded_files)
+                # Merge new files into the existing dict so cached files from a
+                # previous session aren't wiped when the user adds a new pcap.
+                st.session_state.pcap_data_by_file.update(pcap_by_file)
+                combined = [p for packets in st.session_state.pcap_data_by_file.values() for p in packets]
+                combined.sort(key=lambda p: p.time)
                 st.session_state.pcap_data = combined
-                st.session_state.pcap_data_by_file = pcap_by_file
             st.session_state.parsed_file_signature = file_signature
-            # Keep lightweight metadata so we can show file info after a refresh
-            # (UploadedFile objects themselves cannot be pickled/persisted).
             for f in uploaded_files:
                 st.session_state.file_metadata[f.name] = {
                     'name': f.name, 'size': f.size, 'type': getattr(f, 'type', ''),
@@ -1364,11 +1418,224 @@ def _render_ip_counts(label, series, widget_key):
             st.dataframe(ports_df, hide_index=True, use_container_width=True)
 
 
+_MODBUS_FC_INFO = {
+    1:  ('Read Coils',                      'Read'),
+    2:  ('Read Discrete Inputs',            'Read'),
+    3:  ('Read Holding Registers',          'Read'),
+    4:  ('Read Input Registers',            'Read'),
+    5:  ('Write Single Coil',               'Write'),
+    6:  ('Write Single Register',           'Write'),
+    7:  ('Read Exception Status',           'Diagnostic'),
+    8:  ('Diagnostics',                     'Diagnostic'),
+    11: ('Get Comm Event Counter',          'Diagnostic'),
+    12: ('Get Comm Event Log',              'Diagnostic'),
+    15: ('Write Multiple Coils',            'Write'),
+    16: ('Write Multiple Registers',        'Write'),
+    17: ('Report Server ID',                'Diagnostic'),
+    20: ('Read File Record',                'Read'),
+    21: ('Write File Record',               'Write'),
+    22: ('Mask Write Register',             'Write'),
+    23: ('Read/Write Multiple Registers',   'Read+Write'),
+    24: ('Read FIFO Queue',                 'Read'),
+    43: ('Encapsulated Interface Transport','Diagnostic'),
+}
+_MODBUS_USER_DEFINED = set(range(65, 73)) | set(range(100, 111))
+
+_MODBUS_EXCEPTION_CODES = {
+    1:  'Illegal Function Code',
+    2:  'Illegal Data Address',
+    3:  'Illegal Data Value',
+    4:  'Server Device Failure',
+    5:  'Acknowledge',
+    6:  'Server Device Busy',
+    7:  'Negative Acknowledge',
+    8:  'Memory Parity Error',
+    10: 'Gateway Path Unavailable',
+    11: 'Gateway Target Device Failed to Respond',
+}
+
+
+def _modbus_fc_flag(fc):
+    if fc in _MODBUS_FC_INFO:
+        return ''
+    if fc >= 128:
+        return '⚠ Error code as request'
+    if fc in _MODBUS_USER_DEFINED:
+        return 'User-defined'
+    return '⚠ Reserved'
+
+
+def _modbus_addr_qty(pdu, fc):
+    g = lambda f: getattr(pdu, f, None)
+    if fc in (1, 2, 3, 4):
+        return g('startAddr'), g('quantity')
+    if fc == 5:
+        return g('outputAddr'), g('outputValue')
+    if fc == 6:
+        return g('registerAddr'), g('registerValue')
+    if fc in (15, 16):
+        return g('startAddr'), g('quantityOutput') or g('quantityRegisters')
+    if fc == 22:
+        return g('refAddr'), None
+    if fc == 23:
+        return g('writeStartingAddr'), g('writeQuantityRegisters')
+    return None, None
+
+
+def get_modbus_breakdown(PCAPS):
+    fc_counts      = collections.Counter()
+    unit_id_counts = collections.Counter()
+    request_rows   = []
+    exception_rows = []
+
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        src = pcap.getlayer("IP").src
+        dst = pcap.getlayer("IP").dst
+
+        # ── Requests (from engineering station / HMI to PLC) ──────────────
+        if pcap.haslayer(ModbusADURequest):
+            adu = pcap.getlayer(ModbusADURequest)
+            unit_id = adu.unitId
+            unit_id_counts[unit_id] += 1
+            pdu = adu.payload
+            fc = getattr(pdu, 'funcCode', None)
+            if fc is None:
+                continue
+            fc_counts[fc] += 1
+            addr, qty = _modbus_addr_qty(pdu, fc)
+            fc_name, _ = _MODBUS_FC_INFO.get(fc, ('Unknown (FC %d)' % fc, 'Unknown'))
+            request_rows.append({
+                'Source IP':   src,
+                'Dest IP':     dst,
+                'Unit ID':     unit_id,
+                'FC':          fc,
+                'Function':    fc_name,
+                'Start Addr':  addr if addr is not None else '-',
+                'Qty / Value': qty  if qty  is not None else '-',
+            })
+
+        # ── Exception responses (PLC rejecting a command) ──────────────────
+        if pcap.haslayer(ModbusADUResponse):
+            adu = pcap.getlayer(ModbusADUResponse)
+            pdu = adu.payload
+            fc = getattr(pdu, 'funcCode', None)
+            if fc is None or fc < 0x80:
+                continue  # not an error response
+            orig_fc = fc & 0x7F
+            except_code = getattr(pdu, 'exceptCode', None)
+            orig_name, _ = _MODBUS_FC_INFO.get(orig_fc, ('Unknown (FC %d)' % orig_fc, 'Unknown'))
+            except_meaning = _MODBUS_EXCEPTION_CODES.get(except_code, 'Unknown (code %s)' % except_code)
+            security_note = ''
+            if except_code == 1:
+                security_note = 'Device does not support this function — possible probe'
+            elif except_code in (2, 3):
+                security_note = 'Invalid address/value — possible reconnaissance or misconfigured write'
+            elif except_code == 4:
+                security_note = 'Device failure — check device health'
+            exception_rows.append({
+                'PLC IP':          src,
+                'Requester IP':    dst,
+                'Unit ID':         adu.unitId,
+                'Rejected FC':     orig_fc,
+                'Rejected Function': orig_name,
+                'Exception Code':  except_code,
+                'Meaning':         except_meaning,
+                'Security Note':   security_note,
+            })
+
+    # Function code summary
+    fc_rows = []
+    for fc, count in sorted(fc_counts.items()):
+        name, category = _MODBUS_FC_INFO.get(fc, ('Unknown (FC %d)' % fc, 'Unknown'))
+        fc_rows.append({
+            'FC': fc, 'Name': name, 'Category': category,
+            'Count': count, 'Flag': _modbus_fc_flag(fc),
+        })
+
+    fc_df        = pd.DataFrame(fc_rows) if fc_rows else pd.DataFrame(columns=['FC','Name','Category','Count','Flag'])
+    detail_df    = pd.DataFrame(request_rows) if request_rows else pd.DataFrame(columns=['Source IP','Dest IP','Unit ID','FC','Function','Start Addr','Qty / Value'])
+    unit_df      = pd.DataFrame({'Unit ID': list(unit_id_counts.keys()),
+                                 'Requests': list(unit_id_counts.values())}).sort_values('Requests', ascending=False) \
+                   if unit_id_counts else pd.DataFrame(columns=['Unit ID','Requests'])
+    exception_df = pd.DataFrame(exception_rows) if exception_rows else pd.DataFrame(columns=['PLC IP','Requester IP','Unit ID','Rejected FC','Rejected Function','Exception Code','Meaning','Security Note'])
+    return fc_df, detail_df, unit_df, exception_df
+
+
+def show_modbus_breakdown(PCAPS):
+    _sig = st.session_state.parsed_file_signature
+    fc_df, detail_df, unit_df, exception_df = _cached_modbus_breakdown(_sig, PCAPS)
+
+    if fc_df.empty and exception_df.empty:
+        return  # No Modbus traffic — section stays hidden
+
+    st.divider()
+    st.subheader("Modbus Traffic Breakdown")
+
+    total      = int(fc_df['Count'].sum()) if not fc_df.empty else 0
+    reads      = int(fc_df[fc_df['Category'] == 'Read']['Count'].sum()) if not fc_df.empty else 0
+    writes     = int(fc_df[fc_df['Category'].isin(['Write','Read+Write'])]['Count'].sum()) if not fc_df.empty else 0
+    diag       = int(fc_df[fc_df['Category'] == 'Diagnostic']['Count'].sum()) if not fc_df.empty else 0
+    unusual    = int((fc_df['Flag'] != '').sum()) if not fc_df.empty else 0
+    exceptions = len(exception_df)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Requests", total)
+    c2.metric("Read", reads)
+    c3.metric("Write", writes)
+    c4.metric("Diagnostic", diag)
+    c5.metric("Unusual FCs", unusual,  delta=unusual    if unusual    else None, delta_color="inverse" if unusual    else "off")
+    c6.metric("Exceptions",  exceptions, delta=exceptions if exceptions else None, delta_color="inverse" if exceptions else "off")
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.markdown("**Function Code Summary**")
+        if unusual:
+            st.warning("⚠ %d unusual function code(s) detected — check the Flag column." % unusual)
+        st.dataframe(fc_df, use_container_width=True, hide_index=True)
+
+        if not fc_df.empty:
+            fig = px.bar(fc_df, x='Name', y='Count', color='Category',
+                         title='Function Code Distribution',
+                         color_discrete_map={'Read': '#4a90d9', 'Write': '#e05c5c',
+                                             'Diagnostic': '#a0a0a0', 'Read+Write': '#c47bd9',
+                                             'Unknown': '#ff9900'})
+            fig.update_layout(title_x=0.5, xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_right:
+        st.markdown("**Unit IDs Seen**")
+        st.dataframe(unit_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Request Details**")
+    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+    st.download_button("Download as PDF",
+        data=generate_table_pdf("Modbus Request Details", detail_df, orientation="L"),
+        file_name="modbus_breakdown.pdf", mime="application/pdf",
+        key="dl_modbus_breakdown")
+
+    # ── Exception Responses ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("**Exception Responses** (commands rejected by the PLC)")
+    if exception_df.empty:
+        st.success("No exception responses detected — all commands were accepted.")
+    else:
+        if any(exception_df['Security Note'] != ''):
+            st.warning("⚠ %d exception(s) with security relevance detected — check the Security Note column." % int((exception_df['Security Note'] != '').sum()))
+        st.dataframe(exception_df, use_container_width=True, hide_index=True)
+        st.download_button("Download exceptions as PDF",
+            data=generate_table_pdf("Modbus Exception Responses", exception_df, orientation="L"),
+            file_name="modbus_exceptions.pdf", mime="application/pdf",
+            key="dl_modbus_exceptions")
+
+
 def RawDataView():
     pcap_data = select_active_pcap_data()
     if pcap_data:
-        # Example: Get all PCAPs
-        all_data = get_all_pcap(pcap_data, PD)
+        _sig = st.session_state.parsed_file_signature
+        all_data = _cached_all_pcap(_sig, pcap_data, PD)
         dataframe_data = process_json_data(all_data)
         start_time, end_time, live_time_duration, live_time_duration_str = calculate_live_time(pcap_data)
 
@@ -1377,11 +1644,11 @@ def RawDataView():
         # dataframe_data['End Time'] = end_time
         dataframe_data['Live Time Duration'] = live_time_duration_str
         all_columns = list(dataframe_data.columns)
-        st.sidebar.header("P1ease Filter Here:")
+        st.sidebar.header("Please Filter Here:")
         # st.sidebar.divider()
         # Filter reset button
         if st.sidebar.button("Reset Filters"):
-            st.experimental_rerun()
+            st.rerun()
         # Multiselect for filtering by protocol
         selected_protocols = st.sidebar.multiselect(
             "Select Protocol:",
@@ -1481,6 +1748,8 @@ def RawDataView():
 
                 # Destination Counts
                 _render_ip_counts("Destination Counts:", Data_to_display_df['Destination'], "destination_ports_dropdown")
+
+        show_modbus_breakdown(pcap_data)
     else:
         st.warning("Please upload a valid PCAP file.")
 
@@ -1619,17 +1888,245 @@ def common_protocol_df(data):
     return pd.DataFrame({'Protocol': list(data.keys()), 'Packet Count': list(data.values())})
 
 
+_PDF_EMOJI_MAP = {
+    # Severity emoji — the word "High/Medium/Low" already follows, so just drop the emoji
+    '🔴': '', '🟡': '', '🔵': '',
+    '⬇': 'IN', '⬆': 'OUT',
+    '🚨': '', '🔑': '', '🛡': '', '⚠': '',
+}
+
+
+def _pdf_sanitize(text):
+    # Replace emoji with readable plain-text equivalents, then drop anything
+    # outside Latin-1 so Helvetica doesn't raise FPDFUnicodeEncodingException.
+    # Coerce non-strings (e.g. float NaN from None cells) to str first.
+    if not isinstance(text, str):
+        text = str(text)
+    for emoji, replacement in _PDF_EMOJI_MAP.items():
+        text = text.replace(emoji, replacement)
+    return text.strip().encode('latin-1', errors='ignore').decode('latin-1')
+
+
+_PDF_HEADING_STYLE = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(45, 75, 140))
+_PDF_ROW_FILL     = (235, 240, 252)   # soft blue-grey for alternating rows
+
+
+def _render_pdf_table(pdf, table_data, col_widths=None):
+    # Reset fill/text colour so alternating row fills aren't tainted by
+    # whatever section-header colour was set last.
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", size=8)
+    with pdf.table(
+        table_data,
+        col_widths=col_widths,
+        first_row_as_headings=True,
+        headings_style=_PDF_HEADING_STYLE,
+        cell_fill_color=_PDF_ROW_FILL,
+        cell_fill_mode="ROWS",
+        line_height=5,
+    ):
+        pass
+
+
 def generate_table_pdf(title, df, orientation="P", col_widths=None):
     pdf = FPDF(orientation=orientation)
+    pdf.set_margins(10, 10, 10)
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-    pdf.set_font("Helvetica", size=9)
-    table_data = [list(df.columns)] + df.astype(str).values.tolist()
-    with pdf.table(table_data, col_widths=col_widths):
-        pass
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 10, _pdf_sanitize(title), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    raw_rows = [list(df.columns)] + df.astype(str).values.tolist()
+    table_data = [[_pdf_sanitize(cell) for cell in row] for row in raw_rows]
+    _render_pdf_table(pdf, table_data, col_widths=col_widths)
     return bytes(pdf.output())
+
+
+def _pdf_section(pdf, title):
+    pdf.set_fill_color(28, 37, 65)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 9, _pdf_sanitize(title), fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(2)
+
+
+def _pdf_subsection(pdf, title):
+    pdf.set_fill_color(70, 90, 130)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(0, 7, _pdf_sanitize(title), fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(1)
+
+
+def _pdf_table(pdf, df, col_widths=None):
+    if df is None or df.empty:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(120, 120, 120)
+        pdf.cell(0, 6, "No data found.", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+        return
+    raw_rows = [list(df.columns)] + df.astype(str).values.tolist()
+    table_data = [[_pdf_sanitize(c) for c in row] for row in raw_rows]
+    try:
+        _render_pdf_table(pdf, table_data, col_widths=col_widths)
+    except Exception:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 6, "Table could not be rendered (content too large).", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+
+def _pdf_metric_row(pdf, metrics):
+    box_w = int(pdf.epw / len(metrics))
+    for label, value in metrics:
+        pdf.set_fill_color(240, 240, 248)
+        pdf.set_draw_color(150, 150, 200)
+        pdf.set_font("Helvetica", "B", 14)
+        x, y = pdf.get_x(), pdf.get_y()
+        pdf.rect(x, y, box_w - 2, 16, style="FD")
+        pdf.set_xy(x, y + 1)
+        pdf.cell(box_w - 2, 7, _pdf_sanitize(str(value)), align="C")
+        pdf.set_xy(x, y + 8)
+        pdf.set_font("Helvetica", size=7)
+        pdf.cell(box_w - 2, 6, _pdf_sanitize(label), align="C")
+        pdf.set_xy(x + box_w, y)
+    pdf.ln(20)
+
+
+def generate_full_report(data_of_pcap, file_names):
+    from datetime import datetime as _dt
+
+    # Gather all data upfront — use cached wrappers so re-generating the report
+    # within the same session hits the cache instead of recomputing everything.
+    _sig = st.session_state.parsed_file_signature
+    device_df    = _cached_device_inventory(_sig, data_of_pcap)
+    firmware_df  = _cached_firmware_inventory(_sig, data_of_pcap)
+    av_edr_df    = _cached_av_edr_inventory(_sig, data_of_pcap)
+    alerts_df    = _cached_security_alerts(_sig, data_of_pcap)
+    creds_df     = _cached_credential_exposure(_sig, data_of_pcap)
+    cve_df       = get_cve_findings(data_of_pcap)
+    fc_df, detail_df, unit_df, exception_df = _cached_modbus_breakdown(_sig, data_of_pcap)
+
+    start_t, end_t, duration, duration_str = calculate_live_time(data_of_pcap)
+
+    high_alerts = int((alerts_df['Severity'].str.startswith('🔴')).sum()) if not alerts_df.empty else 0
+    med_alerts  = int((alerts_df['Severity'].str.startswith('🟡')).sum()) if not alerts_df.empty else 0
+    low_alerts  = int((alerts_df['Severity'].str.startswith('🔵')).sum()) if not alerts_df.empty else 0
+
+    pdf = FPDF(orientation="L")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.set_margins(10, 10, 10)
+
+    # ── Cover page ────────────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_fill_color(28, 37, 65)
+    pdf.rect(0, 0, 297, 210, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 28)
+    pdf.ln(40)
+    pdf.cell(0, 14, "OT PCAP Analysis Report", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=12)
+    pdf.ln(4)
+    pdf.cell(0, 8, "Generated: %s" % _dt.now().strftime("%Y-%m-%d %H:%M"), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(10)
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(0, 7, "Files analysed: %s" % ", ".join(file_names), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Total packets: %d" % len(data_of_pcap), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Capture duration: %s" % duration_str, align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+    # ── Executive Summary ─────────────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "Executive Summary")
+    _pdf_metric_row(pdf, [
+        ("Total Devices",    len(device_df)),
+        ("High Alerts",      high_alerts),
+        ("Medium Alerts",    med_alerts),
+        ("Low Alerts",       low_alerts),
+        ("CVEs Found",       len(cve_df)),
+        ("Credentials Exposed", len(creds_df)),
+        ("Modbus Requests",  int(fc_df['Count'].sum()) if not fc_df.empty else 0),
+        ("Modbus Exceptions",len(exception_df)),
+    ])
+
+    # ── Device Inventory ──────────────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "Device Inventory")
+    _pdf_table(pdf, device_df)
+
+    # ── Firmware / Version Hints ──────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "Firmware / Version Hints")
+    _pdf_table(pdf, firmware_df)
+
+    # ── AV / EDR Vendor Traffic ───────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "AV / EDR Vendor Traffic")
+    _pdf_table(pdf, av_edr_df)
+
+    # ── Security Alerts ───────────────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "Security Alerts")
+    _pdf_table(pdf, alerts_df)
+
+    # ── Credential Exposure ───────────────────────────────────────────────────
+    _pdf_section(pdf, "Credential Exposure")
+    _pdf_table(pdf, creds_df)
+
+    # ── CVE Findings ──────────────────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "CVE Findings")
+    _pdf_table(pdf, cve_df)
+
+    # ── Modbus Breakdown ──────────────────────────────────────────────────────
+    pdf.add_page()
+    _pdf_section(pdf, "Modbus Traffic Breakdown")
+    _pdf_subsection(pdf, "Function Code Summary")
+    _pdf_table(pdf, fc_df)
+    _pdf_subsection(pdf, "Unit IDs Seen")
+    _pdf_table(pdf, unit_df)
+    _pdf_subsection(pdf, "Request Details")
+    _pdf_table(pdf, detail_df)
+    _pdf_subsection(pdf, "Exception Responses")
+    _pdf_table(pdf, exception_df)
+
+    return bytes(pdf.output())
+
+
+def page_report():
+    st.subheader("Full Analysis Report")
+    if not st.session_state.pcap_data_by_file:
+        st.warning("No data loaded. Upload a PCAP file first.")
+        return
+
+    data_of_pcap = select_active_pcap_data()
+    if not data_of_pcap:
+        st.warning("No valid data for the selected capture.")
+        return
+
+    st.markdown(
+        "Generates a single PDF bundling all findings: device inventory, firmware hints, "
+        "AV/EDR traffic, security alerts, credential exposure, CVE lookup, and Modbus breakdown."
+    )
+
+    if st.button("Generate Report", type="primary"):
+        file_names = list(st.session_state.pcap_data_by_file.keys())
+        with st.spinner("Building report — this may take a moment (CVE lookup is cached)…"):
+            try:
+                report_bytes = generate_full_report(data_of_pcap, file_names)
+                st.success("Report ready.")
+                st.download_button(
+                    "Download PDF Report",
+                    data=report_bytes,
+                    file_name="ot_pcap_report_%s.pdf" % datetime.now().strftime("%Y%m%d_%H%M"),
+                    mime="application/pdf",
+                    key="dl_full_report",
+                )
+            except Exception as e:
+                st.error("Report generation failed: %s" % e)
 
 
 def DrawFoliumMap(data):
@@ -1652,17 +2149,498 @@ def DrawFoliumMap(data):
     # Display the map in Streamlit
     folium_static(m,width=1820 , height=600)
 
+# ── Security analysis ─────────────────────────────────────────────────────────
+
+_MODBUS_WRITE_LAYERS = (
+    "ModbusPDU05WriteSingleCoilRequest",
+    "ModbusPDU06WriteSingleRegisterRequest",
+    "ModbusPDU0FWriteMultipleCoilsRequest",
+    "ModbusPDU10WriteMultipleRegistersRequest",
+    "ModbusPDU15WriteFileRecordRequest",
+    "ModbusPDU16MaskWriteRegisterRequest",
+    "ModbusPDU17ReadWriteMultipleRegistersRequest",
+)
+
+
+def _security_scan(PCAPS):
+    # Single pass over all packets collecting data for both alerts and
+    # credential exposure — previously these were 7 separate full iterations.
+    arp_ip_macs   = collections.defaultdict(set)
+    modbus_writes  = collections.defaultdict(list)
+    src_dst_ports  = collections.defaultdict(set)
+    telnet_pairs   = set()
+    ftp_pairs      = set()
+    http_pairs     = set()
+    cred_rows      = []
+
+    for pcap in PCAPS:
+        # ARP spoofing
+        if pcap.haslayer("ARP"):
+            arp = pcap.getlayer("ARP")
+            if arp.op == 2:
+                arp_ip_macs[arp.psrc].add(arp.hwsrc)
+
+        if not pcap.haslayer("IP"):
+            continue
+        ip_layer = pcap.getlayer("IP")
+        src, dst = ip_layer.src, ip_layer.dst
+
+        # Modbus writes
+        for layer_name in _MODBUS_WRITE_LAYERS:
+            if pcap.haslayer(layer_name):
+                modbus_writes[(src, dst)].append(
+                    layer_name.replace("ModbusPDU", "").replace("Request", ""))
+                break
+
+        # TCP-specific checks
+        if pcap.haslayer("TCP"):
+            tcp = pcap.getlayer("TCP")
+            sp, dp = tcp.sport, tcp.dport
+            src_dst_ports[src].add((dst, dp))
+            if sp == 23 or dp == 23:
+                telnet_pairs.add((src, dst))
+            if sp == 21 or dp == 21:
+                ftp_pairs.add((src, dst))
+            if sp == 80 or dp == 80:
+                http_pairs.add((src, dst))
+
+            # Credential extraction
+            ts = datetime.fromtimestamp(float(pcap.time)).strftime('%Y-%m-%d %H:%M:%S')
+            if pcap.haslayer("Raw"):
+                payload_text = _to_text(pcap.getlayer("Raw").load) or ''
+                if sp == 21 or dp == 21:
+                    m = re.match(r'^(USER|PASS)\s+(\S+)', payload_text.strip(), re.IGNORECASE)
+                    if m:
+                        ctype = m.group(1).upper()
+                        cred_rows.append({'Time': ts, 'Protocol': 'FTP',
+                                          'Source IP': src, 'Destination IP': dst,
+                                          'Type': ctype,
+                                          'Value': m.group(2).strip() if ctype == 'USER' else '****'})
+                if sp == 23 or dp == 23:
+                    if re.search(r'(login|username|user)\s*:', payload_text, re.IGNORECASE):
+                        cred_rows.append({'Time': ts, 'Protocol': 'Telnet',
+                                          'Source IP': src, 'Destination IP': dst,
+                                          'Type': 'Auth prompt', 'Value': payload_text.strip()[:80]})
+
+            if pcap.haslayer(HTTPRequest):
+                auth = pcap.getlayer(HTTPRequest).Authorization
+                if auth:
+                    auth_str = _to_text(auth) or ''
+                    if 'Basic ' in auth_str:
+                        try:
+                            b64_part = auth_str.split('Basic ', 1)[1].strip()
+                            decoded = base64.b64decode(b64_part + '==').decode('utf-8', errors='ignore')
+                            if ':' in decoded:
+                                username, _ = decoded.split(':', 1)
+                                ts = datetime.fromtimestamp(float(pcap.time)).strftime('%Y-%m-%d %H:%M:%S')
+                                cred_rows.append({'Time': ts, 'Protocol': 'HTTP Basic Auth',
+                                                  'Source IP': src, 'Destination IP': dst,
+                                                  'Type': 'Credentials', 'Value': '%s:****' % username})
+                        except Exception:
+                            pass
+
+    return {
+        'arp_ip_macs':  dict(arp_ip_macs),
+        'modbus_writes': dict(modbus_writes),
+        'src_dst_ports': dict(src_dst_ports),
+        'telnet_pairs': telnet_pairs,
+        'ftp_pairs':    ftp_pairs,
+        'http_pairs':   http_pairs,
+        'cred_rows':    cred_rows,
+    }
+
+
+def get_security_alerts(PCAPS):
+    s = _security_scan(PCAPS)
+    alerts = []
+
+    for ip, macs in s['arp_ip_macs'].items():
+        if len(macs) > 1:
+            alerts.append({'Severity': '🔴 High', 'Category': 'ARP Spoofing',
+                            'Description': 'IP %s claimed by %d different MACs: %s' % (ip, len(macs), ', '.join(sorted(macs))),
+                            'Affected IPs': ip})
+
+    for (src, dst), cmds in s['modbus_writes'].items():
+        counter = collections.Counter(cmds)
+        summary = ', '.join('%s×%d' % (c, n) for c, n in counter.most_common(3))
+        alerts.append({'Severity': '🔴 High', 'Category': 'Modbus Write',
+                        'Description': '%s → %s: %d write command(s) — %s' % (src, dst, len(cmds), summary),
+                        'Affected IPs': '%s → %s' % (src, dst)})
+
+    for src, pairs in s['src_dst_ports'].items():
+        if len(pairs) >= 20:
+            alerts.append({'Severity': '🟡 Medium', 'Category': 'Port Scanning',
+                            'Description': '%s contacted %d distinct destination/port combinations' % (src, len(pairs)),
+                            'Affected IPs': src})
+
+    if s['telnet_pairs']:
+        ips = ', '.join('%s→%s' % p for p in sorted(s['telnet_pairs'])[:5])
+        alerts.append({'Severity': '🟡 Medium', 'Category': 'Plaintext Protocol',
+                        'Description': 'Telnet (port 23) detected — plaintext admin access. Pairs: %s%s' % (ips, ' …' if len(s['telnet_pairs']) > 5 else ''),
+                        'Affected IPs': ', '.join(sorted({ip for pair in s['telnet_pairs'] for ip in pair}))})
+
+    if s['ftp_pairs']:
+        ips = ', '.join('%s→%s' % p for p in sorted(s['ftp_pairs'])[:5])
+        alerts.append({'Severity': '🟡 Medium', 'Category': 'Plaintext Protocol',
+                        'Description': 'FTP (port 21) detected — plaintext file transfer. Pairs: %s%s' % (ips, ' …' if len(s['ftp_pairs']) > 5 else ''),
+                        'Affected IPs': ', '.join(sorted({ip for pair in s['ftp_pairs'] for ip in pair}))})
+
+    if s['http_pairs']:
+        alerts.append({'Severity': '🔵 Low', 'Category': 'Unencrypted HTTP',
+                        'Description': 'Plain HTTP (port 80) detected across %d IP pair(s) — use HTTPS instead' % len(s['http_pairs']),
+                        'Affected IPs': ', '.join(sorted({ip for pair in s['http_pairs'] for ip in pair})[:10])})
+
+    if not alerts:
+        return pd.DataFrame(columns=['Severity', 'Category', 'Description', 'Affected IPs'])
+    return pd.DataFrame(alerts)
+
+
+def get_credential_exposure(PCAPS):
+    rows = _security_scan(PCAPS)['cred_rows']
+    if not rows:
+        return pd.DataFrame(columns=['Time', 'Protocol', 'Source IP', 'Destination IP', 'Type', 'Value'])
+    return pd.DataFrame(rows).drop_duplicates()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _query_nvd(keyword):
+    try:
+        resp = requests.get(
+            'https://services.nvd.nist.gov/rest/json/cves/2.0',
+            params={'keywordSearch': keyword, 'resultsPerPage': 10},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        cves = []
+        for item in data.get('vulnerabilities', []):
+            cve = item.get('cve', {})
+            cve_id = cve.get('id', '')
+            desc = next((d['value'] for d in cve.get('descriptions', []) if d.get('lang') == 'en'), '')
+            metrics = cve.get('metrics', {})
+            severity = 'N/A'
+            for key in ('cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'):
+                if key in metrics and metrics[key]:
+                    severity = metrics[key][0].get('cvssData', {}).get('baseSeverity', 'N/A')
+                    break
+            cves.append({'CVE ID': cve_id, 'Severity': severity, 'Summary': desc[:200]})
+        return cves
+    except Exception:
+        return None
+
+
+def get_cve_findings(data_of_pcap):
+    firmware_hints = get_firmware_hints(data_of_pcap)
+    rows = []
+    seen_queries = {}
+
+    for ip, hints in firmware_hints.items():
+        for protocol, hint in hints:
+            match = _match_known_software(protocol, hint)
+            if not match:
+                continue
+            slug, version = match
+            query = '%s %s' % (slug.replace('-', ' '), version)
+            if query not in seen_queries:
+                if seen_queries:          # not the first query — respect NVD rate limit
+                    time.sleep(0.7)       # max ~5 req / 30 s for unauthenticated access
+                seen_queries[query] = _query_nvd(query)
+            cves = seen_queries[query]
+            if not cves:
+                continue
+            for cve in cves:
+                rows.append({
+                    'IP': ip,
+                    'Software': hint,
+                    'CVE ID': cve['CVE ID'],
+                    'CVE Severity': cve['Severity'],
+                    'Summary': cve['Summary'],
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=['IP', 'Software', 'CVE ID', 'CVE Severity', 'Summary'])
+    return pd.DataFrame(rows)
+
+
+def page_security():
+    st.subheader("Security Analysis")
+    if not st.session_state.pcap_data_by_file:
+        st.warning("No data loaded. Upload a PCAP file first.")
+        return
+
+    data_of_pcap = select_active_pcap_data()
+    if not data_of_pcap:
+        st.warning("No valid data for the selected capture.")
+        return
+
+    _sig = st.session_state.parsed_file_signature
+
+    # ── Anomaly Alerts ────────────────────────────────────────────────────────
+    st.markdown("### 🚨 Anomaly Alerts")
+    alerts_df = _cached_security_alerts(_sig, data_of_pcap)
+    if alerts_df.empty:
+        st.success("No anomalies detected in this capture.")
+    else:
+        high   = alerts_df[alerts_df['Severity'].str.startswith('🔴')]
+        medium = alerts_df[alerts_df['Severity'].str.startswith('🟡')]
+        low    = alerts_df[alerts_df['Severity'].str.startswith('🔵')]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Alerts", len(alerts_df))
+        c2.metric("🔴 High", len(high))
+        c3.metric("🟡 Medium", len(medium))
+        c4.metric("🔵 Low", len(low))
+        st.dataframe(alerts_df, use_container_width=True, hide_index=True)
+        st.download_button("Download as PDF",
+            data=generate_table_pdf("Security Alerts", alerts_df, orientation="L"),
+            file_name="security_alerts.pdf", mime="application/pdf",
+            key="dl_security_alerts")
+
+    st.divider()
+
+    # ── Credential Exposure ───────────────────────────────────────────────────
+    st.markdown("### 🔑 Credential Exposure")
+    creds_df = _cached_credential_exposure(_sig, data_of_pcap)
+    if creds_df.empty:
+        st.success("No plaintext credentials detected.")
+    else:
+        st.warning("%d plaintext credential event(s) found." % len(creds_df))
+        st.dataframe(creds_df, use_container_width=True, hide_index=True)
+        st.download_button("Download as PDF",
+            data=generate_table_pdf("Credential Exposure", creds_df, orientation="L"),
+            file_name="credential_exposure.pdf", mime="application/pdf",
+            key="dl_credentials")
+
+    st.divider()
+
+    # ── CVE Lookup ────────────────────────────────────────────────────────────
+    st.markdown("### 🛡️ CVE Lookup")
+    st.caption("Queries the NVD API for known CVEs matching detected firmware/software versions. Results cached for 24 h.")
+    with st.spinner("Looking up CVEs…"):
+        cve_df = get_cve_findings(data_of_pcap)
+    if cve_df.empty:
+        st.info("No CVEs found — either no recognisable software versions were detected, or none had matching NVD entries.")
+    else:
+        st.error("%d CVE(s) found across detected software." % len(cve_df))
+        st.dataframe(cve_df, use_container_width=True, hide_index=True)
+        st.download_button("Download as PDF",
+            data=generate_table_pdf("CVE Findings", cve_df, orientation="L"),
+            file_name="cve_findings.pdf", mime="application/pdf",
+            key="dl_cves")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_topology(PCAPS):
+    # Returns (nodes, edges) where:
+    #   nodes: {ip: {'packets': int, 'bytes': int, 'internal': bool}}
+    #   edges: {(src, dst): {'packets': int, 'bytes': int}}
+    nodes = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0, 'internal': True})
+    edges = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        ip_layer = pcap.getlayer("IP")
+        src, dst = ip_layer.src, ip_layer.dst
+        pkt_len = len(corrupt_bytes(pcap))
+        nodes[src]['packets'] += 1
+        nodes[src]['bytes'] += pkt_len
+        nodes[dst]['packets'] += 1
+        nodes[dst]['bytes'] += pkt_len
+        edges[(src, dst)]['packets'] += 1
+        edges[(src, dst)]['bytes'] += pkt_len
+    for ip, info in nodes.items():
+        info['internal'] = classify_int_ext(ip) == "Internal"
+    return dict(nodes), dict(edges)
+
+
+def build_agraph_components(nodes, edges, min_packets, focus_nodes=None):
+    visible_nodes = set()
+    for (src, dst), info in edges.items():
+        if info['packets'] >= min_packets:
+            visible_nodes.add(src)
+            visible_nodes.add(dst)
+
+    max_bytes = max((n['bytes'] for n in nodes.values()), default=1) or 1
+    ag_nodes = []
+    for ip, info in nodes.items():
+        if ip not in visible_nodes:
+            continue
+        size = 10 + 40 * (info['bytes'] / max_bytes)
+        is_focus = focus_nodes and ip in focus_nodes
+        if is_focus:
+            color = "#FFD700"
+        elif info['internal']:
+            color = "#4a90d9"
+        else:
+            color = "#e05c5c"
+        tooltip = (
+            "%s\nType: %s\nPackets: %d\nBytes: %d%s"
+        ) % (
+            ip,
+            "Internal" if info['internal'] else "External",
+            info['packets'],
+            info['bytes'],
+            "\n[Filter match]" if is_focus else "",
+        )
+        ag_nodes.append(Node(id=ip, label=ip, title=tooltip, color=color, size=size))
+
+    max_edge_pkts = max((e['packets'] for e in edges.values()), default=1) or 1
+    ag_edges = []
+    for (src, dst), info in edges.items():
+        if info['packets'] < min_packets:
+            continue
+        width = 1 + 8 * (info['packets'] / max_edge_pkts)
+        tooltip = "Packets: %d  Bytes: %d" % (info['packets'], info['bytes'])
+        ag_edges.append(Edge(source=src, target=dst, title=tooltip, width=width, color="#aaaaaa"))
+
+    config = Config(
+        height=650, width="100%", directed=True, physics=True,
+        stabilization=True, maxVelocity=50,
+    )
+    return ag_nodes, ag_edges, config
+
+
+def page_topology():
+    st.subheader("Network Topology")
+    if not st.session_state.pcap_data_by_file:
+        st.warning("No data loaded. Upload a PCAP file first.")
+        return
+
+    data_of_pcap = select_active_pcap_data()
+    if not data_of_pcap:
+        st.warning("No valid data for the selected capture.")
+        return
+
+    nodes, edges = _cached_topology(st.session_state.parsed_file_signature, data_of_pcap)
+    if not edges:
+        st.warning("No IP traffic found in this capture.")
+        return
+
+    col_filter, col_slider = st.columns([2, 3])
+    with col_filter:
+        ip_filter_input = st.text_input(
+            "Focus on IP or network (CIDR)",
+            value="",
+            placeholder="e.g. 192.168.1.10 or 192.168.1.0/24",
+            help="Shows only the matching IPs and their direct neighbours. Leave blank for the full map.",
+            key="topology_ip_filter",
+        )
+
+    # Parse and apply the optional focus filter
+    focus_network = parse_ip_filter(ip_filter_input) if ip_filter_input.strip() else None
+    if ip_filter_input.strip() and focus_network is None:
+        st.error("Invalid IP or CIDR — showing the full map instead.")
+
+    if focus_network is not None:
+        # Nodes that match the filter
+        focus_nodes = {
+            ip for ip in nodes
+            if _ip_in_network(ip, focus_network)
+        }
+        if not focus_nodes:
+            st.warning("No IPs in this capture match that filter — showing the full map.")
+            focus_nodes = None
+            visible_nodes = set(nodes.keys())
+            visible_edges = edges
+        else:
+            # Expand to direct neighbours (1 hop) so you can see what they talk to
+            neighbour_nodes = set()
+            for (src, dst) in edges:
+                if src in focus_nodes:
+                    neighbour_nodes.add(dst)
+                if dst in focus_nodes:
+                    neighbour_nodes.add(src)
+            visible_nodes = focus_nodes | neighbour_nodes
+            visible_edges = {
+                (s, d): info for (s, d), info in edges.items()
+                if s in visible_nodes and d in visible_nodes
+            }
+            nodes = {ip: info for ip, info in nodes.items() if ip in visible_nodes}
+            edges = visible_edges
+    else:
+        focus_nodes = None
+
+    max_edge = max((e['packets'] for e in edges.values()), default=1)
+    with col_slider:
+        min_packets = st.slider(
+            "Minimum packets per connection",
+            min_value=1, max_value=max(2, max_edge), value=1, step=1,
+            key="topology_min_packets",
+        )
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Unique IPs", len(nodes))
+    col2.metric("Connections", sum(1 for e in edges.values() if e['packets'] >= min_packets))
+    col3.metric("Total Packets", sum(e['packets'] for e in edges.values()))
+
+    st.caption("🔵 Internal (RFC1918)  🔴 External (public)  🟡 Filter match — click a node to inspect its connections. Node size = traffic volume, edge thickness = packet count.")
+
+    ag_nodes, ag_edges, config = build_agraph_components(nodes, edges, min_packets, focus_nodes=focus_nodes)
+    clicked_node = agraph(nodes=ag_nodes, edges=ag_edges, config=config)
+
+    # ── Node inspector — driven by clicking a node directly on the graph ──────
+    if clicked_node:
+        st.divider()
+        st.subheader("Connections for  %s" % clicked_node)
+        inbound_rows, outbound_rows = [], []
+        for (src, dst), info in edges.items():
+            if info['packets'] < min_packets:
+                continue
+            if dst == clicked_node:
+                inbound_rows.append({
+                    'Source IP': src,
+                    'Type': classify_int_ext(src),
+                    'Packets': info['packets'],
+                    'Bytes': info['bytes'],
+                })
+            if src == clicked_node:
+                outbound_rows.append({
+                    'Destination IP': dst,
+                    'Type': classify_int_ext(dst),
+                    'Packets': info['packets'],
+                    'Bytes': info['bytes'],
+                })
+
+        inbound_df  = pd.DataFrame(inbound_rows).sort_values('Packets', ascending=False)  if inbound_rows  else pd.DataFrame(columns=['Source IP', 'Type', 'Packets', 'Bytes'])
+        outbound_df = pd.DataFrame(outbound_rows).sort_values('Packets', ascending=False) if outbound_rows else pd.DataFrame(columns=['Destination IP', 'Type', 'Packets', 'Bytes'])
+
+        col_in, col_out = st.columns(2)
+        with col_in:
+            st.subheader("⬇ Inbound  (%d)" % len(inbound_df))
+            st.dataframe(inbound_df, use_container_width=True, hide_index=True)
+        with col_out:
+            st.subheader("⬆ Outbound  (%d)" % len(outbound_df))
+            st.dataframe(outbound_df, use_container_width=True, hide_index=True)
+
+
+_NAV_TABS  = ["Home", "Upload File", "Raw Data & Filtering", "Analysis", "Topology", "Security", "Report", "Geoplots"]
+_NAV_ICONS = ["house", "upload", "files", "graph-up", "diagram-3", "shield-exclamation", "file-earmark-text", "globe"]
+
+
 def main():
     st.set_page_config(page_title="PCAP Dashboard", page_icon="📈", layout="wide")
-    # download from Bootstrap
+
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = _NAV_TABS[0]
+
+    active_idx = _NAV_TABS.index(st.session_state.active_tab)
+
+    # ── Top horizontal navigation ─────────────────────────────────────────────
     selected = option_menu(
         menu_title=None,
-        options=["Home", "Upload File", "Raw Data & Filtering", "Analysis","Geoplots"],
-        icons=["house", "upload", "files", "graph-up","globe"],
+        options=_NAV_TABS,
+        icons=_NAV_ICONS,
         menu_icon="cast",
         default_index=0,
-        orientation="horizontal"
+        orientation="horizontal",
+        manual_select=active_idx,
+        key="nav_top",
     )
+    if selected and selected != st.session_state.active_tab:
+        st.session_state.active_tab = selected
+        st.rerun()
+
+    selected = st.session_state.active_tab
 
     # Intro Page
     if selected == "Home":
@@ -1823,8 +2801,9 @@ def main():
                 # ///////////////////////////////////////////
                 # ////        Device Inventory          /////
                 # ///////////////////////////////////////////
+                _sig = st.session_state.parsed_file_signature
                 st.title("Device Inventory")
-                device_df = get_device_inventory(data_of_pcap)
+                device_df = _cached_device_inventory(_sig, data_of_pcap)
                 st.dataframe(device_df, use_container_width=True)
                 st.download_button(
                     "Download as PDF",
@@ -1835,7 +2814,7 @@ def main():
                 )
 
                 st.title("Firmware/Version Hints")
-                firmware_df = get_firmware_inventory(data_of_pcap)
+                firmware_df = _cached_firmware_inventory(_sig, data_of_pcap)
                 if firmware_df.empty:
                     st.info("No firmware/version hints found (requires unencrypted "
                             "HTTP/SNMP/Modbus/EtherNet-IP/FTP/Telnet/VNC/S7comm/BACnet/SSDP traffic).")
@@ -1850,7 +2829,7 @@ def main():
                     )
 
                 st.title("AV/EDR Vendor Traffic")
-                av_edr_df = get_av_edr_inventory(data_of_pcap)
+                av_edr_df = _cached_av_edr_inventory(_sig, data_of_pcap)
                 if av_edr_df.empty:
                     st.info("No AV/EDR vendor traffic detected (matches DNS queries, TLS SNI, and "
                             "HTTP Host/User-Agent against known antivirus/EDR vendor domains). "
@@ -1921,6 +2900,15 @@ def main():
 
 
 
+    if selected == "Topology":
+        page_topology()
+
+    if selected == "Security":
+        page_security()
+
+    if selected == "Report":
+        page_report()
+
     if selected == "Geoplots":
         st.subheader("Geoplot")
         # ///////////////////////////////////////////
@@ -1947,8 +2935,6 @@ def main():
                     DrawFoliumMap(ipmap_result)
             else:
                 st.warning("No valid data for Geoplot.")
-
-
 
 
 
