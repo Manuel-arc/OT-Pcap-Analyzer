@@ -11,4 +11,5 @@ streamlit_option_menu
 plotly
 requests
 fpdf2
-streamlit-agraph
+streamlit-agrap
+

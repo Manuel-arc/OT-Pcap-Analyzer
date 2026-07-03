@@ -35,7 +35,6 @@ import pandas as pd
 from scapy.utils import corrupt_bytes
 from streamlit_echarts import st_echarts
 import geoip2.database
-import pydeck as pdk
 import folium
 from streamlit_option_menu import option_menu
 from utils.pcap_decode import PcapDecode
