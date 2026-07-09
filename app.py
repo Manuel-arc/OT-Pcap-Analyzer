@@ -2161,6 +2161,188 @@ _MODBUS_WRITE_LAYERS = (
 )
 
 
+# ── Active Directory / Windows protocol detection ────────────────────────────
+from scapy.layers.ntlm import NTLM_Header, NTLM_AUTHENTICATE, NTLM_AUTHENTICATE_V2
+from scapy.layers.smb  import SMB_Header
+from scapy.layers.smb2 import SMB2_Header, SMB2_Negotiate_Protocol_Response
+from scapy.layers.ldap import LDAP, LDAP_BindRequest, LDAP_SearchRequest
+from scapy.layers.kerberos import KerberosTCPHeader
+
+_AD_PORTS = {
+    88:   'Kerberos',
+    389:  'LDAP',
+    445:  'SMB',
+    636:  'LDAPS',
+    3268: 'LDAP Global Catalog',
+    3269: 'LDAPS Global Catalog',
+    135:  'MSRPC',
+    137:  'NetBIOS-NS',
+    138:  'NetBIOS-DGM',
+    139:  'NetBIOS-SSN',
+    5985: 'WinRM',
+    5986: 'WinRM-HTTPS',
+    593:  'RPC over HTTP',
+}
+
+_SMB2_DIALECTS = {
+    0x0202: 'SMB 2.0.2', 0x0210: 'SMB 2.1',
+    0x0300: 'SMB 3.0',   0x0302: 'SMB 3.0.2',
+    0x0311: 'SMB 3.1.1', 0x02FF: 'SMB 2.x (wildcard)',
+}
+
+_NTLM_MSG_TYPES = {1: 'Negotiate', 2: 'Challenge', 3: 'Authenticate'}
+
+_LDAP_OPS = {
+    0: 'Bind',     1: 'Bind Response',  2: 'Unbind',
+    3: 'Search',   4: 'Search Entry',   5: 'Search Done',
+    6: 'Modify',   8: 'Add',            10: 'Delete',
+    12: 'Modify DN', 14: 'Compare',     16: 'Abandon',
+    23: 'Extended', 24: 'Extended Response',
+}
+
+
+def get_ad_detection(PCAPS):
+    # Per-IP protocol presence (server side — IPs being contacted on AD ports)
+    server_protocols = collections.defaultdict(set)   # ip -> set of protocol names
+    client_protocols = collections.defaultdict(set)   # ip -> set of protocol names
+    smb_versions     = []   # {src, dst, version, negotiated_dialect}
+    smb1_pairs       = set()
+    ntlm_rows        = []
+    ldap_rows        = []
+    ldap_search_count = collections.Counter()  # source IP -> count
+
+    for pcap in PCAPS:
+        if not pcap.haslayer("IP"):
+            continue
+        ip = pcap.getlayer("IP")
+        src, dst = ip.src, ip.dst
+
+        # Port-based AD protocol presence
+        if pcap.haslayer("TCP"):
+            tcp = pcap.getlayer("TCP")
+            for port, proto in _AD_PORTS.items():
+                if tcp.dport == port:
+                    server_protocols[dst].add(proto)
+                    client_protocols[src].add(proto)
+                if tcp.sport == port:
+                    server_protocols[src].add(proto)
+                    client_protocols[dst].add(proto)
+        if pcap.haslayer("UDP"):
+            udp = pcap.getlayer("UDP")
+            for port, proto in _AD_PORTS.items():
+                if udp.dport == port:
+                    server_protocols[dst].add(proto)
+                    client_protocols[src].add(proto)
+
+        # SMBv1 detection
+        if pcap.haslayer(SMB_Header):
+            smb1_pairs.add((src, dst))
+
+        # SMBv2 dialect negotiation
+        if pcap.haslayer(SMB2_Negotiate_Protocol_Response):
+            neg = pcap.getlayer(SMB2_Negotiate_Protocol_Response)
+            dialect_val = int(neg.DialectRevision)
+            dialect_str = _SMB2_DIALECTS.get(dialect_val, 'Unknown (0x%04x)' % dialect_val)
+            smb_versions.append({
+                'Server IP': src, 'Client IP': dst,
+                'Dialect': dialect_str, 'Raw Value': '0x%04x' % dialect_val,
+            })
+
+        # NTLM
+        if pcap.haslayer(NTLM_Header):
+            hdr = pcap.getlayer(NTLM_Header)
+            msg_type = int(hdr.MessageType)
+            msg_name = _NTLM_MSG_TYPES.get(msg_type, 'Unknown')
+            ntlm_version = '-'
+            if msg_type == 3:
+                if pcap.haslayer(NTLM_AUTHENTICATE_V2):
+                    ntlm_version = 'NTLMv2'
+                elif pcap.haslayer(NTLM_AUTHENTICATE):
+                    auth = pcap.getlayer(NTLM_AUTHENTICATE)
+                    # NTLMv1 NT response is exactly 24 bytes
+                    ntlm_version = 'NTLMv1' if auth.NtChallengeResponseLen == 24 else 'NTLMv2'
+            ntlm_rows.append({
+                'Source IP': src, 'Dest IP': dst,
+                'Message': msg_name, 'NTLM Version': ntlm_version,
+            })
+
+        # LDAP operations
+        if pcap.haslayer(LDAP):
+            ldap_pkt = pcap.getlayer(LDAP)
+            op_id = int(ldap_pkt.protocolOp) if ldap_pkt.protocolOp is not None else -1
+            op_name = _LDAP_OPS.get(op_id, 'Op %d' % op_id)
+            detail = ''
+            if pcap.haslayer(LDAP_BindRequest):
+                bind = pcap.getlayer(LDAP_BindRequest)
+                auth_type = str(type(bind.authentication).__name__)
+                if 'simple' in auth_type.lower() or op_id == 0:
+                    detail = 'Simple bind (plaintext credentials!)'
+            if pcap.haslayer(LDAP_SearchRequest):
+                ldap_search_count[src] += 1
+            ldap_rows.append({
+                'Source IP': src, 'Dest IP': dst,
+                'Operation': op_name, 'Detail': detail,
+            })
+
+    # Build DataFrames
+    proto_rows = []
+    all_ips = set(server_protocols) | set(client_protocols)
+    dc_candidates = {
+        ip for ip in server_protocols
+        if len({'Kerberos', 'LDAP', 'SMB'} & server_protocols[ip]) >= 2
+    }
+    for ip in sorted(all_ips):
+        protos = (server_protocols.get(ip, set()) | client_protocols.get(ip, set()))
+        proto_rows.append({
+            'IP': ip,
+            'AD Protocols Seen': ', '.join(sorted(protos)),
+            'Likely DC': 'Yes' if ip in dc_candidates else '',
+        })
+
+    # Security findings specific to AD
+    ad_alerts = []
+    if smb1_pairs:
+        ips = ', '.join('%s→%s' % p for p in sorted(smb1_pairs)[:5])
+        ad_alerts.append({'Severity': '🔴 Critical', 'Finding': 'SMBv1 Detected',
+                          'Detail': 'SMBv1 traffic found — vulnerable to EternalBlue (MS17-010). Pairs: %s' % ips})
+    ntlm1 = [r for r in ntlm_rows if r['NTLM Version'] == 'NTLMv1']
+    if ntlm1:
+        ips = ', '.join(sorted({r['Source IP'] for r in ntlm1})[:5])
+        ad_alerts.append({'Severity': '🔴 High', 'Finding': 'NTLMv1 Detected',
+                          'Detail': 'NTLMv1 hashes are crackable offline in minutes. Sources: %s' % ips})
+    plain_binds = [r for r in ldap_rows if 'plaintext' in r['Detail']]
+    if plain_binds:
+        ips = ', '.join(sorted({r['Source IP'] for r in plain_binds})[:5])
+        ad_alerts.append({'Severity': '🔴 High', 'Finding': 'LDAP Simple Bind (Plaintext)',
+                          'Detail': 'Credentials sent in cleartext over LDAP port 389. Sources: %s' % ips})
+    enum_ips = {ip for ip, count in ldap_search_count.items() if count > 50}
+    if enum_ips:
+        ad_alerts.append({'Severity': '🟡 Medium', 'Finding': 'Possible LDAP Enumeration',
+                          'Detail': 'High LDAP search volume (>50 queries) — possible BloodHound/AD enumeration. IPs: %s' % ', '.join(sorted(enum_ips))})
+    if dc_candidates:
+        ad_alerts.append({'Severity': '🔵 Info', 'Finding': 'Active Directory Found in Capture',
+                          'Detail': 'Domain Controller(s) identified: %s — AD presence in OT network is an IT/OT convergence finding.' % ', '.join(sorted(dc_candidates))})
+    winrm_ips = {ip for ip, protos in server_protocols.items() if 'WinRM' in protos}
+    if winrm_ips:
+        ad_alerts.append({'Severity': '🟡 Medium', 'Finding': 'WinRM Detected',
+                          'Detail': 'Windows Remote Management (port 5985/5986) found — remote code execution protocol. IPs: %s' % ', '.join(sorted(winrm_ips))})
+
+    return {
+        'proto_df':   pd.DataFrame(proto_rows) if proto_rows else pd.DataFrame(columns=['IP', 'AD Protocols Seen', 'Likely DC']),
+        'smb_df':     pd.DataFrame(smb_versions) if smb_versions else pd.DataFrame(columns=['Server IP', 'Client IP', 'Dialect', 'Raw Value']),
+        'smb1_pairs': smb1_pairs,
+        'ntlm_df':    pd.DataFrame(ntlm_rows).drop_duplicates() if ntlm_rows else pd.DataFrame(columns=['Source IP', 'Dest IP', 'Message', 'NTLM Version']),
+        'ldap_df':    pd.DataFrame(ldap_rows).drop_duplicates() if ldap_rows else pd.DataFrame(columns=['Source IP', 'Dest IP', 'Operation', 'Detail']),
+        'alerts_df':  pd.DataFrame(ad_alerts) if ad_alerts else pd.DataFrame(columns=['Severity', 'Finding', 'Detail']),
+        'dc_candidates': dc_candidates,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _cached_ad_detection(sig, _pcap):
+    return get_ad_detection(_pcap)
+
+
 def _security_scan(PCAPS):
     # Single pass over all packets collecting data for both alerts and
     # credential exposure — previously these were 7 separate full iterations.
@@ -2211,15 +2393,19 @@ def _security_scan(PCAPS):
                     m = re.match(r'^(USER|PASS)\s+(\S+)', payload_text.strip(), re.IGNORECASE)
                     if m:
                         ctype = m.group(1).upper()
+                        raw = m.group(2).strip()
                         cred_rows.append({'Time': ts, 'Protocol': 'FTP',
                                           'Source IP': src, 'Destination IP': dst,
                                           'Type': ctype,
-                                          'Value': m.group(2).strip() if ctype == 'USER' else '****'})
+                                          'Value': raw if ctype == 'USER' else '****',
+                                          '_raw': raw})
                 if sp == 23 or dp == 23:
                     if re.search(r'(login|username|user)\s*:', payload_text, re.IGNORECASE):
+                        text_val = payload_text.strip()[:80]
                         cred_rows.append({'Time': ts, 'Protocol': 'Telnet',
                                           'Source IP': src, 'Destination IP': dst,
-                                          'Type': 'Auth prompt', 'Value': payload_text.strip()[:80]})
+                                          'Type': 'Auth prompt', 'Value': text_val,
+                                          '_raw': text_val})
 
             if pcap.haslayer(HTTPRequest):
                 auth = pcap.getlayer(HTTPRequest).Authorization
@@ -2230,11 +2416,13 @@ def _security_scan(PCAPS):
                             b64_part = auth_str.split('Basic ', 1)[1].strip()
                             decoded = base64.b64decode(b64_part + '==').decode('utf-8', errors='ignore')
                             if ':' in decoded:
-                                username, _ = decoded.split(':', 1)
+                                username, password = decoded.split(':', 1)
                                 ts = datetime.fromtimestamp(float(pcap.time)).strftime('%Y-%m-%d %H:%M:%S')
                                 cred_rows.append({'Time': ts, 'Protocol': 'HTTP Basic Auth',
                                                   'Source IP': src, 'Destination IP': dst,
-                                                  'Type': 'Credentials', 'Value': '%s:****' % username})
+                                                  'Type': 'Credentials',
+                                                  'Value': '%s:****' % username,
+                                                  '_raw': decoded})
                         except Exception:
                             pass
 
@@ -2295,10 +2483,24 @@ def get_security_alerts(PCAPS):
 
 
 def get_credential_exposure(PCAPS):
+    # Always drops _raw — safe for reports and PDF exports.
     rows = _security_scan(PCAPS)['cred_rows']
     if not rows:
         return pd.DataFrame(columns=['Time', 'Protocol', 'Source IP', 'Destination IP', 'Type', 'Value'])
+    return pd.DataFrame(rows).drop_duplicates().drop(columns=['_raw'], errors='ignore')
+
+
+def get_credential_exposure_full(PCAPS):
+    # Keeps _raw column for the UI toggle — never exported to PDF.
+    rows = _security_scan(PCAPS)['cred_rows']
+    if not rows:
+        return pd.DataFrame(columns=['Time', 'Protocol', 'Source IP', 'Destination IP', 'Type', 'Value', '_raw'])
     return pd.DataFrame(rows).drop_duplicates()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_credential_exposure_full(sig, _pcap):
+    return get_credential_exposure_full(_pcap)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -2403,11 +2605,30 @@ def page_security():
         st.success("No plaintext credentials detected.")
     else:
         st.warning("%d plaintext credential event(s) found." % len(creds_df))
-        st.dataframe(creds_df, use_container_width=True, hide_index=True)
+
+        show_passwords = st.toggle(
+            "Show passwords in plaintext",
+            value=False,
+            key="show_passwords_toggle",
+            help="Passwords are masked by default. Enable to reveal captured values — handle with care.",
+        )
+
+        if show_passwords:
+            full_df = _cached_credential_exposure_full(_sig, data_of_pcap)
+            display_df = full_df.copy()
+            if '_raw' in display_df.columns:
+                display_df['Value'] = display_df['_raw']
+                display_df = display_df.drop(columns=['_raw'])
+        else:
+            display_df = creds_df
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
         st.download_button("Download as PDF",
             data=generate_table_pdf("Credential Exposure", creds_df, orientation="L"),
             file_name="credential_exposure.pdf", mime="application/pdf",
-            key="dl_credentials")
+            key="dl_credentials",
+            help="PDF always exports with passwords masked.",
+        )
 
     st.divider()
 
@@ -2425,6 +2646,67 @@ def page_security():
             data=generate_table_pdf("CVE Findings", cve_df, orientation="L"),
             file_name="cve_findings.pdf", mime="application/pdf",
             key="dl_cves")
+
+    st.divider()
+
+    # ── Active Directory / Windows Protocol Detection ─────────────────────────
+    st.markdown("### 🪟 Active Directory Detection")
+    st.caption(
+        "Detects AD-related protocols (Kerberos, LDAP, SMB, NTLM, DCE/RPC, WinRM, NetBIOS) "
+        "and extracts security-relevant detail — NTLM version, SMB dialect, plaintext LDAP binds, "
+        "likely Domain Controllers, and enumeration patterns. "
+        "Finding AD traffic in an OT network is an IT/OT convergence finding."
+    )
+
+    ad = _cached_ad_detection(_sig, data_of_pcap)
+
+    if ad['proto_df'].empty or ad['proto_df']['AD Protocols Seen'].eq('').all():
+        st.info("No Active Directory / Windows protocol traffic detected in this capture.")
+    else:
+        # Security findings first
+        if not ad['alerts_df'].empty:
+            st.markdown("#### Security Findings")
+            st.dataframe(ad['alerts_df'], use_container_width=True, hide_index=True)
+            st.download_button("Download findings as PDF",
+                data=generate_table_pdf("AD Security Findings", ad['alerts_df'], orientation="L"),
+                file_name="ad_security_findings.pdf", mime="application/pdf",
+                key="dl_ad_alerts")
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.markdown("#### Protocol Presence per IP")
+            st.dataframe(ad['proto_df'], use_container_width=True, hide_index=True)
+
+            if not ad['smb_df'].empty:
+                st.markdown("#### SMB Dialect Negotiated")
+                st.caption("SMBv1 is vulnerable to EternalBlue (MS17-010) — any presence is a critical finding.")
+                if ad['smb1_pairs']:
+                    st.error("SMBv1 traffic detected! %d session(s)" % len(ad['smb1_pairs']))
+                st.dataframe(ad['smb_df'], use_container_width=True, hide_index=True)
+
+        with col_right:
+            if not ad['ntlm_df'].empty:
+                st.markdown("#### NTLM Authentication")
+                st.caption("NTLMv1 hashes can be cracked offline in minutes. NTLMv2 is stronger but still relayable.")
+                ntlm1_count = int((ad['ntlm_df']['NTLM Version'] == 'NTLMv1').sum())
+                ntlm2_count = int((ad['ntlm_df']['NTLM Version'] == 'NTLMv2').sum())
+                c1, c2 = st.columns(2)
+                c1.metric("NTLMv1 events", ntlm1_count, delta=ntlm1_count if ntlm1_count else None, delta_color="inverse" if ntlm1_count else "off")
+                c2.metric("NTLMv2 events", ntlm2_count)
+                st.dataframe(ad['ntlm_df'], use_container_width=True, hide_index=True)
+
+        if not ad['ldap_df'].empty:
+            st.markdown("#### LDAP Operations")
+            st.caption("Simple bind operations send credentials in plaintext over port 389.")
+            plain = int(ad['ldap_df']['Detail'].str.contains('plaintext', case=False, na=False).sum())
+            if plain:
+                st.error("%d plaintext LDAP bind(s) detected — credentials sent in cleartext." % plain)
+            st.dataframe(ad['ldap_df'], use_container_width=True, hide_index=True)
+            st.download_button("Download LDAP operations as PDF",
+                data=generate_table_pdf("LDAP Operations", ad['ldap_df'], orientation="L"),
+                file_name="ldap_operations.pdf", mime="application/pdf",
+                key="dl_ldap")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
