@@ -2160,6 +2160,65 @@ _MODBUS_WRITE_LAYERS = (
     "ModbusPDU17ReadWriteMultipleRegistersRequest",
 )
 
+# S7comm Job Request (ROSCTR 0x01) function codes worth alerting on. Routine
+# polling (0x04 Read Var, 0xf0 Setup Communication) is deliberately excluded -
+# these are the codes that change PLC state rather than just read it.
+_S7COMM_DANGEROUS_FUNCTIONS = {
+    0x05: 'Write Var',
+    0x1A: 'Request Download',
+    0x1B: 'Download Block',
+    0x28: 'PI-Service (Program Control)',
+    0x29: 'PLC Stop',
+}
+_S7COMM_HIGH_SEVERITY_FUNCTIONS = {'PLC Stop', 'PI-Service (Program Control)'}
+
+# FINS (Omron) command codes (MRC/SRC) confirmed against Wireshark's omron
+# dissector output on the ICS-pcap FINS sample - these change PLC state
+# (run/stop, force I/O, overwrite program/parameter memory) rather than read it.
+_FINS_DANGEROUS_COMMANDS = {
+    0x0102: 'Memory Area Write',
+    0x0202: 'Parameter Area Write',
+    0x0203: 'Parameter Area Clear',
+    0x0307: 'Program Area Write',
+    0x0308: 'Program Area Clear',
+    0x0401: 'Run',
+    0x0402: 'Stop',
+    0x2301: 'Forced Set/Reset',
+}
+_FINS_HIGH_SEVERITY_COMMANDS = {'Run', 'Stop', 'Forced Set/Reset', 'Program Area Write', 'Program Area Clear'}
+
+# Non-IP fieldbus protocols identified purely by EtherType - both are Layer-2
+# only with no authentication concept, so their mere presence is the finding.
+_L2_FIELDBUS_ETHERTYPES = {
+    0x88A4: 'EtherCAT',
+    0x88AB: 'Ethernet POWERLINK',
+}
+
+
+def _s7comm_job_function(payload):
+    # Walks the fixed-size TPKT header (4 bytes) + variable-length COTP header
+    # to reach the S7comm PDU, then returns the function code but only for Job
+    # Request PDUs (ROSCTR 0x01) - i.e. commands sent to the PLC, not its
+    # Ack-Data responses. Offsets verified against tshark's s7comm dissector.
+    if len(payload) < 12 or payload[0] != 0x03:
+        return None
+    cotp_len = payload[4]
+    s7_off = 5 + cotp_len
+    if s7_off + 11 > len(payload) or payload[s7_off] != 0x32:
+        return None
+    if payload[s7_off + 1] != 0x01:
+        return None
+    return payload[s7_off + 10]
+
+
+def _fins_command(payload):
+    # FINS/UDP frame: a fixed 10-byte header (ICF/RSV/GCT/DNA/DA1/DA2/SNA/SA1/
+    # SA2/SID) followed by a 2-byte big-endian command code (MRC+SRC). Offset
+    # verified against tshark's omron dissector on the ICS-pcap FINS sample.
+    if len(payload) < 12:
+        return None
+    return struct.unpack('>H', payload[10:12])[0]
+
 
 # ── Active Directory / Windows protocol detection ────────────────────────────
 from scapy.layers.ntlm import NTLM_Header, NTLM_AUTHENTICATE, NTLM_AUTHENTICATE_V2
@@ -2348,10 +2407,14 @@ def _security_scan(PCAPS):
     # credential exposure — previously these were 7 separate full iterations.
     arp_ip_macs   = collections.defaultdict(set)
     modbus_writes  = collections.defaultdict(list)
+    s7_control     = collections.defaultdict(list)
+    fins_control   = collections.defaultdict(list)
+    l2_fieldbus    = collections.defaultdict(set)
     src_dst_ports  = collections.defaultdict(set)
     telnet_pairs   = set()
     ftp_pairs      = set()
     http_pairs     = set()
+    vnc_pairs      = set()
     cred_rows      = []
 
     for pcap in PCAPS:
@@ -2360,6 +2423,14 @@ def _security_scan(PCAPS):
             arp = pcap.getlayer("ARP")
             if arp.op == 2:
                 arp_ip_macs[arp.psrc].add(arp.hwsrc)
+
+        # Non-IP fieldbus protocols (EtherCAT, POWERLINK) - Layer-2 only,
+        # no authentication concept, so presence on the wire is the finding.
+        if pcap.haslayer("Ether"):
+            ether = pcap.getlayer("Ether")
+            fieldbus_name = _L2_FIELDBUS_ETHERTYPES.get(ether.type)
+            if fieldbus_name:
+                l2_fieldbus[fieldbus_name].add((ether.src, ether.dst))
 
         if not pcap.haslayer("IP"):
             continue
@@ -2388,7 +2459,8 @@ def _security_scan(PCAPS):
             # Credential extraction
             ts = datetime.fromtimestamp(float(pcap.time)).strftime('%Y-%m-%d %H:%M:%S')
             if pcap.haslayer("Raw"):
-                payload_text = _to_text(pcap.getlayer("Raw").load) or ''
+                payload = bytes(pcap.getlayer("Raw").load)
+                payload_text = _to_text(payload) or ''
                 if sp == 21 or dp == 21:
                     m = re.match(r'^(USER|PASS)\s+(\S+)', payload_text.strip(), re.IGNORECASE)
                     if m:
@@ -2406,6 +2478,20 @@ def _security_scan(PCAPS):
                                           'Source IP': src, 'Destination IP': dst,
                                           'Type': 'Auth prompt', 'Value': text_val,
                                           '_raw': text_val})
+
+                # S7comm PLC control - PLC Stop, program download, memory
+                # write sent to the PLC (function code from a Job Request).
+                if sp == 102 or dp == 102:
+                    func = _s7comm_job_function(payload)
+                    action = _S7COMM_DANGEROUS_FUNCTIONS.get(func)
+                    if action:
+                        s7_control[(src, dst)].append(action)
+
+                # VNC/RFB remote HMI access - weak native auth (or none),
+                # typically unencrypted. Presence alone is the finding.
+                if 5900 <= sp <= 5906 or 5900 <= dp <= 5906:
+                    if payload.startswith(b'RFB '):
+                        vnc_pairs.add((src, dst))
 
             if pcap.haslayer(HTTPRequest):
                 auth = pcap.getlayer(HTTPRequest).Authorization
@@ -2426,13 +2512,31 @@ def _security_scan(PCAPS):
                         except Exception:
                             pass
 
+        # UDP-specific checks
+        elif pcap.haslayer("UDP"):
+            udp = pcap.getlayer("UDP")
+            sp, dp = udp.sport, udp.dport
+
+            # FINS (Omron) PLC control - Run/Stop, forced I/O, program/memory
+            # writes sent to the PLC.
+            if (sp == 9600 or dp == 9600) and pcap.haslayer("Raw"):
+                payload = bytes(pcap.getlayer("Raw").load)
+                cmd = _fins_command(payload)
+                action = _FINS_DANGEROUS_COMMANDS.get(cmd)
+                if action:
+                    fins_control[(src, dst)].append(action)
+
     return {
         'arp_ip_macs':  dict(arp_ip_macs),
         'modbus_writes': dict(modbus_writes),
+        's7_control':   dict(s7_control),
+        'fins_control': dict(fins_control),
+        'l2_fieldbus':  dict(l2_fieldbus),
         'src_dst_ports': dict(src_dst_ports),
         'telnet_pairs': telnet_pairs,
         'ftp_pairs':    ftp_pairs,
         'http_pairs':   http_pairs,
+        'vnc_pairs':    vnc_pairs,
         'cred_rows':    cred_rows,
     }
 
@@ -2453,6 +2557,34 @@ def get_security_alerts(PCAPS):
         alerts.append({'Severity': '🔴 High', 'Category': 'Modbus Write',
                         'Description': '%s → %s: %d write command(s) — %s' % (src, dst, len(cmds), summary),
                         'Affected IPs': '%s → %s' % (src, dst)})
+
+    for (src, dst), actions in s['s7_control'].items():
+        counter = collections.Counter(actions)
+        summary = ', '.join('%s×%d' % (c, n) for c, n in counter.most_common(3))
+        severity = '🔴 High' if any(a in _S7COMM_HIGH_SEVERITY_FUNCTIONS for a in actions) else '🟡 Medium'
+        alerts.append({'Severity': severity, 'Category': 'S7comm Control',
+                        'Description': '%s → %s: %d unauthenticated command(s) — %s' % (src, dst, len(actions), summary),
+                        'Affected IPs': '%s → %s' % (src, dst)})
+
+    for (src, dst), actions in s['fins_control'].items():
+        counter = collections.Counter(actions)
+        summary = ', '.join('%s×%d' % (c, n) for c, n in counter.most_common(3))
+        severity = '🔴 High' if any(a in _FINS_HIGH_SEVERITY_COMMANDS for a in actions) else '🟡 Medium'
+        alerts.append({'Severity': severity, 'Category': 'FINS Control',
+                        'Description': '%s → %s: %d unauthenticated command(s) — %s' % (src, dst, len(actions), summary),
+                        'Affected IPs': '%s → %s' % (src, dst)})
+
+    if s['vnc_pairs']:
+        ips = ', '.join('%s→%s' % p for p in sorted(s['vnc_pairs'])[:5])
+        alerts.append({'Severity': '🟡 Medium', 'Category': 'Remote Access',
+                        'Description': 'VNC (RFB) session detected — weak native authentication and typically unencrypted. Pairs: %s%s' % (ips, ' …' if len(s['vnc_pairs']) > 5 else ''),
+                        'Affected IPs': ', '.join(sorted({ip for pair in s['vnc_pairs'] for ip in pair}))})
+
+    for name, pairs in s['l2_fieldbus'].items():
+        macs = ', '.join('%s→%s' % p for p in sorted(pairs)[:5])
+        alerts.append({'Severity': '🔵 Low', 'Category': 'Unauthenticated Fieldbus',
+                        'Description': '%s traffic detected (%d MAC pair(s)) — Layer-2 protocol with no authentication by design, relies entirely on physical segmentation. Pairs: %s%s' % (name, len(pairs), macs, ' …' if len(pairs) > 5 else ''),
+                        'Affected IPs': macs})
 
     for src, pairs in s['src_dst_ports'].items():
         if len(pairs) >= 20:
