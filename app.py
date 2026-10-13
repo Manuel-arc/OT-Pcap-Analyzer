@@ -23,16 +23,15 @@ from scapy.contrib.modbus import (
 )
 import base64
 import collections
+import hashlib
 import ipaddress
 import pathlib
 import pickle
 import re
 import struct
-import tempfile
 import sys
 from streamlit_agraph import agraph, Node, Edge, Config
 import pandas as pd
-from scapy.utils import corrupt_bytes
 from streamlit_echarts import st_echarts
 import geoip2.database
 import folium
@@ -47,13 +46,18 @@ PD = PcapDecode()  # Parser
 PCAPS = None  # Packets
 
 # ── Session persistence ───────────────────────────────────────────────────────
-# Parsed packet data (scapy Packet objects) is pickled to disk so it survives
-# a browser page-refresh without requiring the user to re-upload their files.
-# The original UploadedFile objects cannot be persisted (they're tied to the
-# active upload session), but the parsed pcap_data_by_file dict can.
+# Parsed packet data (a pandas DataFrame - see PcapDecode.build_dataframe) is
+# pickled to disk so it survives a browser page-refresh without requiring the
+# user to re-upload their files. The original UploadedFile objects cannot be
+# persisted (they're tied to the active upload session), but the parsed
+# pcap_data_by_file dict can. Uploaded bytes are also written straight into
+# _PCAP_CACHE_DIR (not a throwaway tempfile) so protocol-level tabs (Modbus
+# breakdown, Security, AD detection, ...) can lazily re-run scapy on them -
+# including after a refresh, since this directory persists across restarts.
 
 _CACHE_DIR = pathlib.Path.home() / ".cache" / "ot-pcap-analyzer"
 _CACHE_FILE = _CACHE_DIR / "session.pkl"
+_PCAP_CACHE_DIR = _CACHE_DIR / "pcaps"
 
 
 def _save_session_cache():
@@ -64,6 +68,7 @@ def _save_session_cache():
             'pcap_data_by_file': st.session_state.pcap_data_by_file,
             'parsed_file_signature': st.session_state.parsed_file_signature,
             'file_metadata': st.session_state.get('file_metadata', {}),
+            'file_tmp_paths': st.session_state.get('file_tmp_paths', {}),
         }
         with open(_CACHE_FILE, 'wb') as f:
             pickle.dump(payload, f)
@@ -77,10 +82,18 @@ def _load_session_cache():
             return False
         with open(_CACHE_FILE, 'rb') as f:
             payload = pickle.load(f)
+        pcap_data_by_file = payload.get('pcap_data_by_file', {})
+        # Cache written by a pre-DataFrame-migration version of this app
+        # stored scapy Packet lists here instead - discard it rather than
+        # feeding incompatible data into DataFrame-only code paths.
+        if any(not isinstance(v, pd.DataFrame) for v in pcap_data_by_file.values()):
+            _clear_session_cache()
+            return False
         st.session_state.pcap_data = payload.get('pcap_data')
-        st.session_state.pcap_data_by_file = payload.get('pcap_data_by_file', {})
+        st.session_state.pcap_data_by_file = pcap_data_by_file
         st.session_state.parsed_file_signature = payload.get('parsed_file_signature')
         st.session_state.file_metadata = payload.get('file_metadata', {})
+        st.session_state.file_tmp_paths = payload.get('file_tmp_paths', {})
         return bool(st.session_state.pcap_data_by_file)
     except Exception:
         return False
@@ -90,6 +103,11 @@ def _clear_session_cache():
     try:
         if _CACHE_FILE.exists():
             _CACHE_FILE.unlink()
+        for path in st.session_state.get('file_tmp_paths', {}).values():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     except Exception:
         pass
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +128,13 @@ if 'parsed_file_signature' not in st.session_state:
 if 'file_metadata' not in st.session_state:
     st.session_state.file_metadata = {}
 
+if 'file_tmp_paths' not in st.session_state:
+    # filename -> path under _PCAP_CACHE_DIR of the original uploaded bytes,
+    # kept around so deep-dissection tabs can lazily rdpcap() them on demand
+    # (see select_active_scapy_packets) instead of every upload paying that
+    # cost upfront regardless of which tab actually needs it.
+    st.session_state.file_tmp_paths = {}
+
 if 'uploader_key_version' not in st.session_state:
     # Bumped whenever files are cleared/removed so the file_uploader widget
     # below is recreated with a fresh key - otherwise Streamlit keeps the
@@ -120,43 +145,6 @@ if 'uploader_key_version' not in st.session_state:
 # Restore parsed data from disk on a fresh session (e.g. after page refresh).
 if st.session_state.pcap_data is None and not st.session_state.pcap_data_by_file:
     _load_session_cache()
-
-def get_all_pcap(PCAPS, PD):
-    pcaps = collections.OrderedDict()
-    for count, i in enumerate(PCAPS, 1):
-        pcaps[count] = PD.ether_decode(i)
-    return pcaps
-
-
-def get_filter_pcap(PCAPS, PD, key, value):
-    pcaps = collections.OrderedDict()
-    count = 1
-    for p in PCAPS:
-        pcap = PD.ether_decode(p)
-        if key == 'Procotol':
-            if value == pcap.get('Procotol').upper():
-                pcaps[count] = pcap
-                count += 1
-            else:
-                pass
-        elif key == 'Source':
-            if value == pcap.get('Source').upper():
-                pcaps[count] = pcap
-                count += 1
-        elif key == 'Destination':
-            if value == pcap.get('Destination').upper():
-                pcaps[count] = pcap
-                count += 1
-        else:
-            pass
-    return pcaps
-
-
-def process_json_data(json_data):
-    # Convert JSON data to a pandas DataFrame
-    df = pd.DataFrame.from_dict(json_data, orient='index')
-    return df
-
 
 # To Calculate Live Time
 def calculate_live_time(pcap_data):
@@ -169,31 +157,25 @@ def calculate_live_time(pcap_data):
 
 
 # protocol length statistics
-def pcap_len_statistic(PCAPS):
+def pcap_len_statistic(df):
     pcap_len_dict = {'0-300': 0, '301-600': 0, '601-900': 0, '901-1200': 0, '1201-1500': 0, '1500-more': 0}
-    if PCAPS is None:
+    if df is None or df.empty:
         return pcap_len_dict
-    for pcap in PCAPS:
-        pcap_len = len(corrupt_bytes(pcap))
-        if 0 < pcap_len < 300:
-            pcap_len_dict['0-300'] += 1
-        elif 301 <= pcap_len < 600:
-            pcap_len_dict['301-600'] += 1
-        elif 601 <= pcap_len < 900:
-            pcap_len_dict['601-900'] += 1
-        elif 901 <= pcap_len < 1200:
-            pcap_len_dict['901-1200'] += 1
-        elif 1201 <= pcap_len <= 1500:
-            pcap_len_dict['1201-1500'] += 1
-        elif pcap_len > 1500:
-            pcap_len_dict['1500-more'] += 1
-        else:
-            pass
+    n = df['len']
+    # Exact boundaries the original per-packet if/elif chain used - note the
+    # gaps (values of exactly 300/600/900/1200 fall in none of these and are
+    # silently dropped, same as before) are intentionally preserved as-is.
+    pcap_len_dict['0-300']     = int(((n > 0) & (n < 300)).sum())
+    pcap_len_dict['301-600']   = int(((n >= 301) & (n < 600)).sum())
+    pcap_len_dict['601-900']   = int(((n >= 601) & (n < 900)).sum())
+    pcap_len_dict['901-1200']  = int(((n >= 901) & (n < 1200)).sum())
+    pcap_len_dict['1201-1500'] = int(((n >= 1201) & (n <= 1500)).sum())
+    pcap_len_dict['1500-more'] = int((n > 1500).sum())
     return pcap_len_dict
 
 
 # protocol freq statistics
-def common_proto_statistic(PCAPS, PD):
+def common_proto_statistic(df, PD):
     common_proto_dict = collections.OrderedDict()
     common_proto_dict['IP'] = 0
     common_proto_dict['IPv6'] = 0
@@ -204,87 +186,59 @@ def common_proto_statistic(PCAPS, PD):
     common_proto_dict['UDP'] = 0
     common_proto_dict['Others'] = 0
 
-    if PCAPS is None:
+    if df is None or df.empty:
         return common_proto_dict
-    for pcap in PCAPS:
-        if pcap.haslayer("ARP"):
-            common_proto_dict['ARP'] += 1
-        elif pcap.haslayer("ICMP") or pcap.haslayer("ICMPv6ND_NS"):
-            common_proto_dict['ICMP'] += 1
-        elif pcap.haslayer("DNS"):
-            common_proto_dict['DNS'] += 1
-        elif pcap.haslayer("TCP"):
-            # Resolve the named protocol (Modbus, DNP3, S7comm, HTTP, ...) from
-            # utils/protocol/PORT and utils/protocol/TCP instead of lumping
-            # every TCP packet into a generic "TCP" bucket.
-            tcp = pcap.getlayer("TCP")
-            proto = PD.PORT_DICT.get(tcp.dport) or PD.PORT_DICT.get(tcp.sport) \
-                or PD.TCP_DICT.get(tcp.dport) or PD.TCP_DICT.get(tcp.sport)
-            if proto:
-                common_proto_dict[proto] = common_proto_dict.get(proto, 0) + 1
-            else:
-                common_proto_dict['TCP'] += 1
-        elif pcap.haslayer("UDP"):
-            udp = pcap.getlayer("UDP")
-            proto = PD.PORT_DICT.get(udp.dport) or PD.PORT_DICT.get(udp.sport) \
-                or PD.UDP_DICT.get(udp.dport) or PD.UDP_DICT.get(udp.sport)
-            if proto:
-                common_proto_dict[proto] = common_proto_dict.get(proto, 0) + 1
-            else:
-                common_proto_dict['UDP'] += 1
-        elif pcap.haslayer("IP"):
-            # IP packets carrying neither TCP nor UDP (e.g. ESP, GRE, OSPF, ...)
-            common_proto_dict['IP'] += 1
-        elif pcap.haslayer("IPv6"):
-            common_proto_dict['IPv6'] += 1
-        elif pcap.haslayer("Ether"):
-            # Non-IP Ethernet frames (e.g. Profinet RT/DCP run directly on
-            # Ethernet) - resolve by EtherType via utils/protocol/ETHER.
-            proto = PD.ETHER_DICT.get(pcap.getlayer("Ether").type)
-            if proto:
-                common_proto_dict[proto] = common_proto_dict.get(proto, 0) + 1
-            else:
-                common_proto_dict['Others'] += 1
-        else:
-            common_proto_dict['Others'] += 1
+
+    has_ip = df['ip_src'].notna()
+    has_ipv6 = df['ipv6_src'].notna()
+    has_tcp = df['tcp_dport'].notna()
+    has_udp = df['udp_dport'].notna()
+
+    # Resolve the named protocol (Modbus, DNP3, S7comm, HTTP, ...) from
+    # utils/protocol/PORT and utils/protocol/TCP instead of lumping every
+    # TCP/UDP packet into a generic bucket - same priority as tcp_decode/
+    # udp_decode: PORT_DICT (well-known) before TCP_DICT/UDP_DICT (registered).
+    tcp_proto = df['tcp_dport'].map(PD.PORT_DICT).fillna(df['tcp_sport'].map(PD.PORT_DICT)) \
+        .fillna(df['tcp_dport'].map(PD.TCP_DICT)).fillna(df['tcp_sport'].map(PD.TCP_DICT))
+    udp_proto = df['udp_dport'].map(PD.PORT_DICT).fillna(df['udp_sport'].map(PD.PORT_DICT)) \
+        .fillna(df['udp_dport'].map(PD.UDP_DICT)).fillna(df['udp_sport'].map(PD.UDP_DICT))
+    ether_proto = df['eth_type'].map(PD.ETHER_DICT)
+
+    bucket = pd.Series(np.select(
+        [df['has_arp'], df['has_icmp'], df['dns_qry_name'].notna(),
+         has_tcp, has_udp, has_ip, has_ipv6, df['eth_src'].notna()],
+        ['ARP', 'ICMP', 'DNS',
+         tcp_proto.fillna('__TCP__'), udp_proto.fillna('__UDP__'), 'IP', 'IPv6', ether_proto.fillna('__OTHERS__')],
+        default='Others',
+    ))
+    bucket = bucket.replace({'__TCP__': 'TCP', '__UDP__': 'UDP', '__OTHERS__': 'Others'})
+
+    for proto, count in bucket.value_counts().items():
+        common_proto_dict[proto] = common_proto_dict.get(proto, 0) + int(count)
     return common_proto_dict
 
 
 # maximum protocol statistics
-def most_proto_statistic(PCAPS, PD):
-    protos_list = list()
-    for pcap in PCAPS:
-        data = PD.ether_decode(pcap)
-        protos_list.append(data['Procotol'])
-    most_count_dict = collections.OrderedDict(collections.Counter(protos_list).most_common(10))
+def most_proto_statistic(df, PD):
+    if df is None or df.empty:
+        return collections.OrderedDict()
+    most_count_dict = collections.OrderedDict(df['Procotol'].value_counts().head(10).items())
     return most_count_dict
 
 
 # http/https Protocol Statistics
-def http_statistic(PCAPS):
-    http_dict = dict()
-    for pcap in PCAPS:
-        if pcap.haslayer("TCP"):
-            tcp = pcap.getlayer("TCP")
-            dport = tcp.dport
-            sport = tcp.sport
-            ip = None
-            if dport == 80 or dport == 443:
-                ip = pcap.getlayer("IP").dst
-            elif sport == 80 or sport == 443:
-                ip = pcap.getlayer("IP").src
-            if ip:
-                if ip in http_dict:
-                    http_dict[ip] += 1
-                else:
-                    http_dict[ip] = 1
-    return http_dict
+def http_statistic(df):
+    if df is None or df.empty:
+        return {}
+    to_dst = (df['tcp_dport'] == 80) | (df['tcp_dport'] == 443)
+    to_src = (df['tcp_sport'] == 80) | (df['tcp_sport'] == 443)
+    ip = df['ip_dst'].where(to_dst, df['ip_src'].where(to_src))
+    return ip.dropna().value_counts().to_dict()
 
 
-def https_stats_main(PCAPS):
-    http_dict = http_statistic(PCAPS)
-    http_dict = sorted(http_dict.items(),
-                       key=lambda d: d[1], reverse=False)
+def https_stats_main(df):
+    http_dict = http_statistic(df)
+    http_dict = sorted(http_dict.items(), key=lambda d: d[1], reverse=False)
     http_key_list = list()
     http_value_list = list()
     for key, value in http_dict:
@@ -294,37 +248,26 @@ def https_stats_main(PCAPS):
 
 
 # DNS Protocol Statistics
-def dns_statistic(PCAPS):
-    dns_dict = dict()
-    for pcap in PCAPS:
-        if pcap.haslayer("DNSQR"):
-            qname = pcap.getlayer("DNSQR").qname
-            if qname in dns_dict:
-                dns_dict[qname] += 1
-            else:
-                dns_dict[qname] = 1
-    return dns_dict
+def dns_statistic(df):
+    if df is None or df.empty:
+        return {}
+    return df['dns_qry_name'].dropna().value_counts().to_dict()
 
 
-def dns_stats_main(PCAPS):
-    dns_dict = dns_statistic(PCAPS)
+def dns_stats_main(df):
+    dns_dict = dns_statistic(df)
     dns_dict = sorted(dns_dict.items(), key=lambda d: d[1], reverse=False)
     dns_key_list = list()
     dns_value_list = list()
     for key, value in dns_dict:
-        dns_key_list.append(key.decode('utf-8'))
+        dns_key_list.append(key)
         dns_value_list.append(value)
     return dns_key_list, dns_value_list
 
 
-def get_host_ip(PCAPS):
-    ip_list = list()
-    for pcap in PCAPS:
-        if pcap.haslayer("IP"):
-            ip_list.append(pcap.getlayer("IP").src)
-            ip_list.append(pcap.getlayer("IP").dst)
-    host_ip = collections.Counter(ip_list).most_common(1)[0][0]
-    return host_ip
+def get_host_ip(df):
+    ips = pd.concat([df['ip_src'].dropna(), df['ip_dst'].dropna()])
+    return ips.value_counts().idxmax()
 
 
 def _classify_ttl(ttl):
@@ -917,8 +860,33 @@ def _cached_topology(sig, _pcap):
     return build_topology(_pcap)
 
 @st.cache_data(show_spinner=False)
-def _cached_all_pcap(sig, _pcap, _pd):
-    return get_all_pcap(_pcap, _pd)
+def _cached_dashboard_protocol_stats(sig, _pcap, _pd):
+    # Bundled because the Dashboard page always needs all five together, and
+    # scanning the packet list once for the tuple is cheaper than five
+    # separately-cached full passes.
+    return (
+        pcap_len_statistic(_pcap),
+        common_proto_statistic(_pcap, _pd),
+        most_proto_statistic(_pcap, _pd),
+        https_stats_main(_pcap),
+        dns_stats_main(_pcap),
+    )
+
+@st.cache_data(show_spinner=False)
+def _cached_most_flow_statistic(sig, _pcap, _pd):
+    return most_flow_statistic(_pcap, _pd)
+
+@st.cache_data(show_spinner=False)
+def _cached_internal_external_io_stats(sig, _pcap, network_str, _network):
+    return internal_external_io_stats(_pcap, _network)
+
+@st.cache_data(show_spinner=False)
+def _cached_outside_filter_ip_table(sig, _pcap, network_str, _network):
+    return outside_filter_ip_table(_pcap, _network)
+
+@st.cache_data(show_spinner=False)
+def _cached_ipmap(sig, _pcap):
+    return ipmap(_pcap)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -951,94 +919,71 @@ def classify_int_ext(ip_str):
         return "Unknown"
 
 
-def internal_external_io_stats(PCAPS, network):
+def _io_direction(df, network):
+    # For traffic where exactly one side matches the selected IP/network
+    # (IPv4 only, matching the original haslayer("IP") gate), classify the
+    # remote (other) side and which way it's flowing. Shared by
+    # internal_external_io_stats/outside_filter_ip_table below.
+    sub = df[df['ip_src'].notna()]
+    src_in = sub['ip_src'].apply(lambda ip: _ip_in_network(ip, network))
+    dst_in = sub['ip_dst'].apply(lambda ip: _ip_in_network(ip, network))
+    inbound, outbound = dst_in & ~src_in, src_in & ~dst_in
+    mask = inbound | outbound
+    remote = sub['ip_src'].where(inbound, sub['ip_dst'])[mask]
+    direction = pd.Series(np.where(inbound[mask], 'Inbound', 'Outbound'), index=remote.index)
+    return pd.DataFrame({'remote': remote, 'direction': direction, 'len': sub.loc[mask, 'len']})
+
+
+def internal_external_io_stats(df, network):
     # For traffic where exactly one side matches the selected IP/network, classify
     # the remote (other) side as Internal (RFC1918/private) or External (public).
-    stats = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
-    for pcap in PCAPS:
-        if not pcap.haslayer("IP"):
-            continue
-        ip_layer = pcap.getlayer("IP")
-        src, dst = ip_layer.src, ip_layer.dst
-        try:
-            src_in = ipaddress.ip_address(src) in network
-            dst_in = ipaddress.ip_address(dst) in network
-        except ValueError:
-            continue
-
-        if dst_in and not src_in:
-            direction, remote = "Inbound", src
-        elif src_in and not dst_in:
-            direction, remote = "Outbound", dst
-        else:
-            continue
-
-        key = (direction, classify_int_ext(remote))
-        entry = stats[key]
-        entry['packets'] += 1
-        entry['bytes'] += len(corrupt_bytes(pcap))
-
     rows = []
+    flows = _io_direction(df, network) if df is not None and not df.empty else pd.DataFrame(columns=['remote', 'direction', 'len'])
+    remote_type = flows['remote'].apply(classify_int_ext) if not flows.empty else flows['remote']
+    agg = flows.assign(**{'Remote Type': remote_type}).groupby(['direction', 'Remote Type'])['len'].agg(['count', 'sum']) \
+        if not flows.empty else pd.DataFrame()
     for direction in ("Inbound", "Outbound"):
-        for remote_type in ("Internal", "External"):
-            entry = stats.get((direction, remote_type), {'packets': 0, 'bytes': 0})
+        for remote_type_ in ("Internal", "External"):
+            try:
+                packets, total_bytes = agg.loc[(direction, remote_type_)][['count', 'sum']]
+            except (KeyError, TypeError):
+                packets, total_bytes = 0, 0
             rows.append({
                 'Direction': direction,
-                'Remote Type': remote_type,
-                'Packets': entry['packets'],
-                'Bytes': entry['bytes'],
+                'Remote Type': remote_type_,
+                'Packets': int(packets),
+                'Bytes': int(total_bytes),
             })
     return pd.DataFrame(rows)
 
 
-def outside_filter_ip_table(PCAPS, network):
+def outside_filter_ip_table(df, network):
     # Lists each remote IP that falls outside the selected filter (i.e. the
     # "other side" of inbound/outbound traffic), tagged Internal/External.
-    stats = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
-    for pcap in PCAPS:
-        if not pcap.haslayer("IP"):
-            continue
-        ip_layer = pcap.getlayer("IP")
-        src, dst = ip_layer.src, ip_layer.dst
-        try:
-            src_in = ipaddress.ip_address(src) in network
-            dst_in = ipaddress.ip_address(dst) in network
-        except ValueError:
-            continue
-
-        if dst_in and not src_in:
-            direction, remote = "Inbound", src
-        elif src_in and not dst_in:
-            direction, remote = "Outbound", dst
-        else:
-            continue
-
-        entry = stats[(remote, direction)]
-        entry['packets'] += 1
-        entry['bytes'] += len(corrupt_bytes(pcap))
-
     columns = ['IP Address', 'Type', 'Direction', 'Packets', 'Bytes']
-    rows = []
-    for (remote, direction), entry in stats.items():
-        rows.append({
-            'IP Address': remote,
-            'Type': classify_int_ext(remote),
-            'Direction': direction,
-            'Packets': entry['packets'],
-            'Bytes': entry['bytes'],
-        })
-    df = pd.DataFrame(rows, columns=columns)
-    if not df.empty:
-        df = df.sort_values(['Type', 'Direction', 'Packets'], ascending=[True, True, False]).reset_index(drop=True)
-    return df
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+    flows = _io_direction(df, network)
+    if flows.empty:
+        return pd.DataFrame(columns=columns)
+    agg = flows.groupby(['remote', 'direction'])['len'].agg(Packets='count', Bytes='sum').reset_index()
+    out_df = pd.DataFrame({
+        'IP Address': agg['remote'],
+        'Type': agg['remote'].apply(classify_int_ext),
+        'Direction': agg['direction'],
+        'Packets': agg['Packets'],
+        'Bytes': agg['Bytes'],
+    })
+    return out_df.sort_values(['Type', 'Direction', 'Packets'], ascending=[True, True, False]).reset_index(drop=True)
 
 
 
-def most_flow_statistic(PCAPS, PD):
+def most_flow_statistic(df, PD):
     most_flow_dict = collections.defaultdict(int)
-    for pcap in PCAPS:
-        data = PD.ether_decode(pcap)
-        most_flow_dict[data['Procotol']] += len(corrupt_bytes(pcap))
+    if df is None or df.empty:
+        return most_flow_dict
+    for proto, total in df.groupby('Procotol')['len'].sum().items():
+        most_flow_dict[proto] = int(total)
     return most_flow_dict
 
 
@@ -1054,11 +999,16 @@ def getmyip():
 GEOIP_DB_PATH = 'utils/GeoIP/GeoLite2-City.mmdb'
 
 
+@st.cache_resource(show_spinner=False)
+def _get_geoip_reader():
+    return geoip2.database.Reader(GEOIP_DB_PATH)
+
+
 def get_geo(ip):
     if not os.path.exists(GEOIP_DB_PATH):
         return None
     try:
-        reader = geoip2.database.Reader(GEOIP_DB_PATH)
+        reader = _get_geoip_reader()
         response = reader.city(ip)
         city_name = response.country.names['en'] + response.city.names['en']
         longitude = response.location.longitude
@@ -1068,23 +1018,14 @@ def get_geo(ip):
         return None
 
 
-def get_ipmap(PCAPS, host_ip):
+def get_ipmap(df, host_ip):
     geo_dict = dict()
-    ip_value_dict = dict()
     ip_value_list = list()
-    for pcap in PCAPS:
-        if pcap.haslayer("IP"):
-            src = pcap.getlayer("IP").src
-            dst = pcap.getlayer("IP").dst
-            pcap_len = len(corrupt_bytes(pcap))
-            if src == host_ip:
-                oip = dst
-            else:
-                oip = src
-            if oip in ip_value_dict:
-                ip_value_dict[oip] += pcap_len
-            else:
-                ip_value_dict[oip] = pcap_len
+    if df is None or df.empty:
+        return [geo_dict, ip_value_list]
+    sub = df[df['ip_src'].notna()]
+    other_ip = sub['ip_dst'].where(sub['ip_src'] == host_ip, sub['ip_src'])
+    ip_value_dict = sub.groupby(other_ip)['len'].sum().to_dict()
     for ip, value in ip_value_dict.items():
         geo_list = get_geo(ip)
         if geo_list:
@@ -1111,11 +1052,11 @@ def get_ipmap(PCAPS, host_ip):
 #     return geo_dict, ip_value_list, myip_geo
 
 
-def ipmap(PCAPS):
+def ipmap(df):
     # Assuming these functions are defined elsewhere in your code
     myip = getmyip()
-    host_ip = get_host_ip(PCAPS)
-    ipdata = get_ipmap(PCAPS, host_ip)
+    host_ip = get_host_ip(df)
+    ipdata = get_ipmap(df, host_ip)
     geo_dict = ipdata[0]
     ip_value_list = ipdata[1]
     myip_geo = get_geo(myip)
@@ -1156,23 +1097,31 @@ def ipmap(PCAPS):
 
 def parse_uploaded_files(uploaded_files):
     # Parse each valid uploaded file separately (so each can be viewed on its
-    # own) and also build one time-sorted capture merging all of them.
-    pcap_by_file = collections.OrderedDict()
+    # own) via tshark (see PcapDecode.build_dataframe) and also build one
+    # time-sorted DataFrame merging all of them. The original bytes are
+    # written into _PCAP_CACHE_DIR (not a throwaway tempfile) so deep-
+    # dissection tabs can lazily rdpcap() them later - see
+    # select_active_scapy_packets.
+    df_by_file = collections.OrderedDict()
+    tmp_path_by_file = {}
+    _PCAP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for uploaded_file in uploaded_files:
         if not uploaded_file.name.endswith((".pcap", ".cap", "csv")):
             continue
         suffix = os.path.splitext(uploaded_file.name)[1]
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
-        try:
-            pcap_by_file[uploaded_file.name] = list(rdpcap(tmp_path))
-        finally:
-            os.remove(tmp_path)
+        key = hashlib.md5(("%s:%d" % (uploaded_file.name, uploaded_file.size)).encode()).hexdigest()
+        dest_path = str(_PCAP_CACHE_DIR / (key + suffix))
+        with open(dest_path, 'wb') as f:
+            f.write(uploaded_file.getvalue())
+        df_by_file[uploaded_file.name] = PD.build_dataframe(dest_path)
+        tmp_path_by_file[uploaded_file.name] = dest_path
 
-    combined = [packet for packets in pcap_by_file.values() for packet in packets]
-    combined.sort(key=lambda p: p.time)
-    return combined, pcap_by_file
+    if df_by_file:
+        combined = pd.concat(df_by_file.values(), ignore_index=True).sort_values(
+            'time', kind='stable').reset_index(drop=True)
+    else:
+        combined = pd.DataFrame()
+    return combined, df_by_file, tmp_path_by_file
 
 
 def _reset_data_view_selector_if_stale():
@@ -1189,9 +1138,17 @@ def remove_uploaded_file(name, size):
     ]
     st.session_state.pcap_data_by_file.pop(name, None)
     st.session_state.file_metadata.pop(name, None)
-    combined = [packet for packets in st.session_state.pcap_data_by_file.values() for packet in packets]
-    combined.sort(key=lambda p: p.time)
-    st.session_state.pcap_data = combined or None
+    tmp_path = st.session_state.file_tmp_paths.pop(name, None)
+    if tmp_path:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    remaining_dfs = list(st.session_state.pcap_data_by_file.values())
+    st.session_state.pcap_data = (
+        pd.concat(remaining_dfs, ignore_index=True).sort_values('time', kind='stable').reset_index(drop=True)
+        if remaining_dfs else None
+    )
     remaining = st.session_state.uploaded_files or []
     st.session_state.parsed_file_signature = tuple(sorted((f.name, f.size) for f in remaining))
     st.session_state.uploader_key_version += 1
@@ -1221,13 +1178,22 @@ def page_file_upload():
         file_signature = tuple(sorted(accumulated.keys()))
         if st.session_state.parsed_file_signature != file_signature:
             with st.spinner("Parsing uploaded file(s)..."):
-                _, pcap_by_file = parse_uploaded_files(uploaded_files)
+                _, df_by_file, tmp_path_by_file = parse_uploaded_files(uploaded_files)
                 # Merge new files into the existing dict so cached files from a
                 # previous session aren't wiped when the user adds a new pcap.
-                st.session_state.pcap_data_by_file.update(pcap_by_file)
-                combined = [p for packets in st.session_state.pcap_data_by_file.values() for p in packets]
-                combined.sort(key=lambda p: p.time)
-                st.session_state.pcap_data = combined
+                st.session_state.pcap_data_by_file.update(df_by_file)
+                st.session_state.file_tmp_paths.update(tmp_path_by_file)
+                dfs = list(st.session_state.pcap_data_by_file.values())
+                st.session_state.pcap_data = pd.concat(dfs, ignore_index=True).sort_values(
+                    'time', kind='stable').reset_index(drop=True) if dfs else None
+            # Also eagerly warm the scapy parse (Modbus/Security/AD/etc. need
+            # it) right away instead of deferring it to whichever tab gets
+            # visited first - one predictable wait here beats a surprise
+            # pause later, especially since Raw Data always renders the
+            # Modbus breakdown and so triggers this on the very next click.
+            with st.spinner("Running deeper protocol analysis (Modbus/Security/AD/etc.)..."):
+                for tmp_path in tmp_path_by_file.values():
+                    _rdpcap_cached(tmp_path)
             st.session_state.parsed_file_signature = file_signature
             for f in uploaded_files:
                 st.session_state.file_metadata[f.name] = {
@@ -1245,6 +1211,7 @@ def page_file_upload():
             st.session_state.uploader_key_version += 1
             _reset_data_view_selector_if_stale()
             _clear_session_cache()
+            st.session_state.file_tmp_paths = {}
             st.rerun()
     elif st.session_state.pcap_data_by_file:
         # Data was restored from cache (no active upload). Show a banner so
@@ -1262,6 +1229,7 @@ def page_file_upload():
             st.session_state.uploader_key_version += 1
             _reset_data_view_selector_if_stale()
             _clear_session_cache()
+            st.session_state.file_tmp_paths = {}
             st.rerun()
 
 
@@ -1269,12 +1237,49 @@ def select_active_pcap_data():
     # Lets the user view a single uploaded file on its own instead of always
     # seeing every file merged together. Shared widget key so the choice
     # stays consistent across tabs (Raw Data & Filtering / Analysis / Geoplots).
+    # Returns the fast tshark-derived DataFrame - see select_active_scapy_packets
+    # for the lazy scapy equivalent used by protocol-specific deep-dissection tabs.
     pcap_by_file = st.session_state.pcap_data_by_file
     options = ["All Files Combined"] + list(pcap_by_file.keys())
     choice = st.selectbox("View data from:", options, key="data_view_selector")
     if choice == "All Files Combined":
         return st.session_state.pcap_data
-    return pcap_by_file.get(choice, [])
+    return pcap_by_file.get(choice, pd.DataFrame())
+
+
+@st.cache_resource(show_spinner="Running deeper protocol analysis (Modbus/Security/AD/etc.) — one-time cost per file, cached after this...")
+def _rdpcap_cached(path):
+    return list(rdpcap(path))
+
+
+def select_active_scapy_packets():
+    # Mirrors select_active_pcap_data()'s file-selection choice (reads the
+    # same widget state - call select_active_pcap_data() first on any page
+    # that needs both) but returns real scapy Packet objects for the handful
+    # of tabs that need scapy's protocol dissection (Modbus breakdown,
+    # firmware hints, AV/EDR hints, AD detection, S7comm/FINS/credential
+    # security checks, DNS query names). Lazily rdpcap()s each file the first
+    # time it's actually needed, instead of paying that cost for every upload
+    # regardless of which tab gets visited - the fast DataFrame path covers
+    # everything else.
+    tmp_paths = st.session_state.get("file_tmp_paths", {})
+    choice = st.session_state.get("data_view_selector", "All Files Combined")
+    names = list(tmp_paths.keys()) if choice == "All Files Combined" else [choice]
+    combined = []
+    missing = []
+    for name in names:
+        path = tmp_paths.get(name)
+        if path and os.path.exists(path):
+            combined.extend(_rdpcap_cached(path))
+        elif name in tmp_paths:
+            missing.append(name)
+    if missing:
+        st.warning(
+            "Re-upload %s to enable protocol-level analysis (Modbus/Security/AD/etc.) "
+            "for it - its cached copy is no longer available." % ", ".join(missing)
+        )
+    combined.sort(key=lambda p: p.time)
+    return combined
 
 
 def page_display_info():
@@ -1632,11 +1637,13 @@ def show_modbus_breakdown(PCAPS):
 
 def RawDataView():
     pcap_data = select_active_pcap_data()
-    if pcap_data:
-        _sig = st.session_state.parsed_file_signature
-        all_data = _cached_all_pcap(_sig, pcap_data, PD)
-        dataframe_data = process_json_data(all_data)
-        start_time, end_time, live_time_duration, live_time_duration_str = calculate_live_time(pcap_data)
+    if pcap_data is not None and not pcap_data.empty:
+        # build_dataframe() already produces this exact shape (time/Source/
+        # Destination/Procotol/len/info), so no per-packet decode step needed.
+        dataframe_data = pcap_data.copy()
+        start_time = dataframe_data['time'].min()
+        end_time = dataframe_data['time'].max()
+        live_time_duration_str = str(end_time - start_time)
 
         # Add live time information to the data frame
         # dataframe_data['Start Time'] = start_time
@@ -1748,7 +1755,7 @@ def RawDataView():
                 # Destination Counts
                 _render_ip_counts("Destination Counts:", Data_to_display_df['Destination'], "destination_ports_dropdown")
 
-        show_modbus_breakdown(pcap_data)
+        show_modbus_breakdown(select_active_scapy_packets())
     else:
         st.warning("Please upload a valid PCAP file.")
 
@@ -2101,7 +2108,8 @@ def page_report():
         st.warning("No data loaded. Upload a PCAP file first.")
         return
 
-    data_of_pcap = select_active_pcap_data()
+    select_active_pcap_data()  # renders the file-selector widget
+    data_of_pcap = select_active_scapy_packets()  # report needs deep protocol dissection throughout
     if not data_of_pcap:
         st.warning("No valid data for the selected capture.")
         return
@@ -2701,7 +2709,8 @@ def page_security():
         st.warning("No data loaded. Upload a PCAP file first.")
         return
 
-    data_of_pcap = select_active_pcap_data()
+    select_active_pcap_data()  # renders the file-selector widget
+    data_of_pcap = select_active_scapy_packets()  # every check here needs protocol dissection
     if not data_of_pcap:
         st.warning("No valid data for the selected capture.")
         return
@@ -2843,24 +2852,23 @@ def page_security():
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_topology(PCAPS):
+def build_topology(df):
     # Returns (nodes, edges) where:
     #   nodes: {ip: {'packets': int, 'bytes': int, 'internal': bool}}
     #   edges: {(src, dst): {'packets': int, 'bytes': int}}
     nodes = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0, 'internal': True})
     edges = collections.defaultdict(lambda: {'packets': 0, 'bytes': 0})
-    for pcap in PCAPS:
-        if not pcap.haslayer("IP"):
-            continue
-        ip_layer = pcap.getlayer("IP")
-        src, dst = ip_layer.src, ip_layer.dst
-        pkt_len = len(corrupt_bytes(pcap))
-        nodes[src]['packets'] += 1
-        nodes[src]['bytes'] += pkt_len
-        nodes[dst]['packets'] += 1
-        nodes[dst]['bytes'] += pkt_len
-        edges[(src, dst)]['packets'] += 1
-        edges[(src, dst)]['bytes'] += pkt_len
+    if df is None or df.empty:
+        return dict(nodes), dict(edges)
+    sub = df[df['ip_src'].notna()]
+    edge_agg = sub.groupby(['ip_src', 'ip_dst'])['len'].agg(packets='count', bytes='sum')
+    for (src, dst), row in edge_agg.iterrows():
+        packets, total_bytes = int(row['packets']), int(row['bytes'])
+        edges[(src, dst)] = {'packets': packets, 'bytes': total_bytes}
+        nodes[src]['packets'] += packets
+        nodes[src]['bytes'] += total_bytes
+        nodes[dst]['packets'] += packets
+        nodes[dst]['bytes'] += total_bytes
     for ip, info in nodes.items():
         info['internal'] = classify_int_ext(ip) == "Internal"
     return dict(nodes), dict(edges)
@@ -2920,7 +2928,7 @@ def page_topology():
         return
 
     data_of_pcap = select_active_pcap_data()
-    if not data_of_pcap:
+    if data_of_pcap is None or data_of_pcap.empty:
         st.warning("No valid data for the selected capture.")
         return
 
@@ -3074,11 +3082,11 @@ def main():
     if selected == "Analysis":
         st.subheader("Dashboard")
         if "pcap_data" not in st.session_state:
-            st.session_state.pcap_data = []
+            st.session_state.pcap_data = None
         # get analysis of data
         else:
             data_of_pcap = select_active_pcap_data()
-            if not data_of_pcap:
+            if data_of_pcap is None or data_of_pcap.empty:
                 art = """
                 .....+@*+@+..................................................*@+*@+.....
                 ....%-....:*................................................*:....:@....
@@ -3123,17 +3131,15 @@ def main():
 
                 st.code(art)
             else:
-                data_len_stats = pcap_len_statistic(data_of_pcap)  # protocol len statistics
-                data_protocol_stats = common_proto_statistic(data_of_pcap, PD)  # count the occurrences of common network protocols
-                data_count_dict = most_proto_statistic(data_of_pcap,
-                                                       PD)  # counts the occurrences of each protocol and returns most common 10 protocols.
-                http_key, http_value = https_stats_main(data_of_pcap)  # https Protocol Statistics
-                dns_key, dns_value = dns_stats_main(data_of_pcap)  # DNS Protocol Statistics
+                _sig = st.session_state.parsed_file_signature
+                (data_len_stats, data_protocol_stats, data_count_dict,
+                 (http_key, http_value), (dns_key, dns_value)) = \
+                    _cached_dashboard_protocol_stats(_sig, data_of_pcap, PD)
                 # Data Protocol analysis end
 
                 # Traffic analysis start
                 host_ip = get_host_ip(data_of_pcap)
-                most_flow_dict = most_flow_statistic(data_of_pcap, PD)
+                most_flow_dict = _cached_most_flow_statistic(_sig, data_of_pcap, PD)
                 most_flow_dict = sorted(most_flow_dict.items(), key=lambda d: d[1], reverse=True)
                 if len(most_flow_dict) > 10:
                     most_flow_dict = most_flow_dict[0:10]
@@ -3215,8 +3221,9 @@ def main():
                 # ////        Device Inventory          /////
                 # ///////////////////////////////////////////
                 _sig = st.session_state.parsed_file_signature
+                scapy_pcap = select_active_scapy_packets()  # these three need protocol dissection
                 st.title("Device Inventory")
-                device_df = _cached_device_inventory(_sig, data_of_pcap)
+                device_df = _cached_device_inventory(_sig, scapy_pcap)
                 st.dataframe(device_df, use_container_width=True)
                 st.download_button(
                     "Download as PDF",
@@ -3227,7 +3234,7 @@ def main():
                 )
 
                 st.title("Firmware/Version Hints")
-                firmware_df = _cached_firmware_inventory(_sig, data_of_pcap)
+                firmware_df = _cached_firmware_inventory(_sig, scapy_pcap)
                 if firmware_df.empty:
                     st.info("No firmware/version hints found (requires unencrypted "
                             "HTTP/SNMP/Modbus/EtherNet-IP/FTP/Telnet/VNC/S7comm/BACnet/SSDP traffic).")
@@ -3242,7 +3249,7 @@ def main():
                     )
 
                 st.title("AV/EDR Vendor Traffic")
-                av_edr_df = _cached_av_edr_inventory(_sig, data_of_pcap)
+                av_edr_df = _cached_av_edr_inventory(_sig, scapy_pcap)
                 if av_edr_df.empty:
                     st.info("No AV/EDR vendor traffic detected (matches DNS queries, TLS SNI, and "
                             "HTTP Host/User-Agent against known antivirus/EDR vendor domains). "
@@ -3278,7 +3285,7 @@ def main():
                     io_network = parse_ip_filter(host_ip)
 
                 # Internal vs External breakdown of the inbound/outbound traffic
-                io_int_ext_df = internal_external_io_stats(data_of_pcap, io_network)
+                io_int_ext_df = _cached_internal_external_io_stats(_sig, data_of_pcap, str(io_network), io_network)
                 with st.expander("Inbound/Outbound by Internal vs External IPs", expanded=True):
                     st.caption(
                         "Internal = private/RFC1918 address space, External = public address space, "
@@ -3295,7 +3302,7 @@ def main():
                     )
 
                 # IPs outside the filter's scope, tagged Internal/External
-                outside_ip_df = outside_filter_ip_table(data_of_pcap, io_network)
+                outside_ip_df = _cached_outside_filter_ip_table(_sig, data_of_pcap, str(io_network), io_network)
                 with st.expander("IPs Outside the Filter (Internal vs External)", expanded=True):
                     st.caption(
                         "Every remote IP seen talking to/from the filter above that falls outside it, "
@@ -3334,12 +3341,12 @@ def main():
                 "place the `.mmdb` file at that path to enable Geoplots." % GEOIP_DB_PATH
             )
         elif "pcap_data" not in st.session_state:
-            st.session_state.pcap_data = []
+            st.session_state.pcap_data = None
             st.warning("No valid data for Geoplot.")
         else:
             data_of_pcap = select_active_pcap_data()
-            if data_of_pcap:
-                ipmap_result = ipmap(data_of_pcap)
+            if data_of_pcap is not None and not data_of_pcap.empty:
+                ipmap_result = _cached_ipmap(st.session_state.parsed_file_signature, data_of_pcap)
                 if ipmap_result.empty:
                     st.warning("No geolocatable IP addresses found in this capture "
                                "(likely only private/internal addresses).")
